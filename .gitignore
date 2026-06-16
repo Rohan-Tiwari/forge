@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache
+coverage.xml
+*.cover
+
+# Type checking
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.iml
+.DS_Store
+Thumbs.db
+
+# Forge runtime state — these are per-workspace and shouldn't be committed.
+.forge/
+~/.forge/
+~/.skills/
+
+# Personal safety: never commit credentials or env files.
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+credentials*
+
+# Build artefacts
+*.log
+*.tmp
+out/
