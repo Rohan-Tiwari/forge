@@ -289,6 +289,9 @@ class Session:
                     )
                     return result
                 counters.parse_format += 1
+                # Tell the router this role just failed a parse — at 2× it
+                # promotes the next call to the next model in the chain.
+                self.router.note_parse_format_fail("driver")
                 obs_text = (
                     f"Observation:\n```\nFormatError: {gate.parse_problems}. "
                     f"Output must be a markdown response with ```intent then "
@@ -301,6 +304,14 @@ class Session:
             parsed = parse_cell(completion.content)
             code = parsed.code or ""
             preview = Preview.from_gate(gate, workspace=self.workspace).with_code(code)
+
+            # If the gate flagged an intent mismatch (declared writes/network
+            # didn't match AST), notify the router. Two strikes in a row →
+            # next call escalates to a stronger model.
+            if gate.action == GateAction.CONFIRM and any(
+                "undeclared" in r for r in gate.reasons
+            ):
+                self.router.note_intent_mismatch("driver")
 
             should_confirm = self._needs_confirmation(preview, gate)
             if should_confirm:
@@ -379,9 +390,12 @@ class Session:
                 elapsed_s=obs.elapsed_s,
             )
 
-            # Successful cell → reset retry counters.
+            # Successful cell → reset retry counters AND escalation state.
+            # The model just succeeded, so any pending escalation triggers
+            # are no longer warranted.
             if obs.ok:
                 counters.reset()
+                self.router.reset_escalation("driver")
 
             # Feed observation back to the model.
             obs_text = f"Observation:\n```\n{obs.format()}\n```"

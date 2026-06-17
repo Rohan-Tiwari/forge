@@ -55,6 +55,20 @@ class FakeRouter:
         return {"ceiling_usd": self.cost_ceiling_usd, "spent_usd": 0.0,
                 "remaining_usd": self.cost_ceiling_usd, "calls": len(self.calls)}
 
+    # No-op escalation API — session.turn calls these; FakeRouter doesn't
+    # implement model-switching itself.
+    def request_escalation(self, role: str = "driver") -> None:
+        pass
+
+    def note_intent_mismatch(self, role: str = "driver") -> None:
+        pass
+
+    def note_parse_format_fail(self, role: str = "driver") -> None:
+        pass
+
+    def reset_escalation(self, role: str = "driver") -> None:
+        pass
+
 
 @dataclass
 class _FakeRoleConfig:

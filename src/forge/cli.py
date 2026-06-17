@@ -285,6 +285,22 @@ def chat(
                         if not s.skills.skills:
                             console.print("[dim]no skills installed[/]")
                         continue
+                    if cmd == "/escalate":
+                        s.router.request_escalation("driver")
+                        cfg = s.router.roles["driver"]
+                        if cfg.escalation:
+                            console.print(
+                                f"[dim]next call escalates: {cfg.primary} → "
+                                f"{cfg.escalation[0]}[/]"
+                            )
+                        else:
+                            console.print(
+                                "[yellow]no escalation chain configured for "
+                                "driver role.[/] Set ANTHROPIC_API_KEY or "
+                                "OPENAI_API_KEY and restart, or edit roles "
+                                "in your router config."
+                            )
+                        continue
                     if cmd == "/help":
                         console.print(
                             "[bold]commands:[/]\n"
@@ -292,6 +308,7 @@ def chat(
                             "  /cost        show session cost\n"
                             "  /reset       clear kernel globals\n"
                             "  /preview <m> set preview to always|cells|never\n"
+                            "  /escalate    next call uses next model in chain\n"
                             "  /skills      list installed skills\n"
                             "  /exit        quit"
                         )

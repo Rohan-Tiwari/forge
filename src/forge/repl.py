@@ -38,6 +38,7 @@ SLASH_COMMANDS = (
     "/reset",
     "/cost",
     "/preview always", "/preview cells", "/preview never",
+    "/escalate",
     "/skills",
     "/help",
 )

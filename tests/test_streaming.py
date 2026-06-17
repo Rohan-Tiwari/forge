@@ -70,6 +70,18 @@ class FakeStreamingRouter:
     def cost_summary(self):
         return {"ceiling_usd": self.cost_ceiling_usd, "spent_usd": 0.0}
 
+    def request_escalation(self, role: str = "driver") -> None:
+        pass
+
+    def note_intent_mismatch(self, role: str = "driver") -> None:
+        pass
+
+    def note_parse_format_fail(self, role: str = "driver") -> None:
+        pass
+
+    def reset_escalation(self, role: str = "driver") -> None:
+        pass
+
 
 # =============================================================================
 # Streaming tests
