@@ -85,6 +85,7 @@ class Session:
         workspace: Path,
         mode: str = "interactive",      # "interactive" | "auto" | "plan"
         preview: PreviewMode = "cells",   # "always" | "cells" | "never"
+        dry_run: bool = True,             # use overlay dry-run for previews
         max_cells_per_turn: int = 12,
         max_format_retries: int = 2,
         max_empty_retries: int = 1,
@@ -93,6 +94,7 @@ class Session:
         self.workspace = workspace.resolve()
         self.mode = mode
         self.preview_mode = preview
+        self.dry_run = dry_run
         self.max_cells_per_turn = max_cells_per_turn
         self.max_format_retries = max_format_retries
         self.max_empty_retries = max_empty_retries
@@ -311,7 +313,13 @@ class Session:
             # Gate flagged but not parse error — preview + confirm path.
             parsed = parse_cell(completion.content)
             code = parsed.code or ""
-            preview = Preview.from_gate(gate, workspace=self.workspace).with_code(code)
+            if self.dry_run and self.mode != "auto":
+                # Dry-run gives REAL diffs by executing in an overlay
+                preview = Preview.from_dry_run(
+                    gate, code=code, workspace=self.workspace,
+                )
+            else:
+                preview = Preview.from_gate(gate, workspace=self.workspace).with_code(code)
 
             # If the gate flagged an intent mismatch (declared writes/network
             # didn't match AST), notify the router. Two strikes in a row →

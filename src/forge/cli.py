@@ -135,6 +135,7 @@ def _run_session(
     workspace: Path,
     auto: bool,
     preview: str,
+    dry_run: bool = True,
     is_chat: bool = False,
 ) -> "Session":
     """Build a Session for either `run` or `chat`. Honors --auto / --preview."""
@@ -142,7 +143,9 @@ def _run_session(
     ensure_dirs(workspace)
     mode = "auto" if auto else "interactive"
     session_cls = Session if auto else InteractiveSession
-    return session_cls(workspace=workspace, mode=mode, preview=preview)
+    return session_cls(
+        workspace=workspace, mode=mode, preview=preview, dry_run=dry_run,
+    )
 
 
 def _format_user_error(e: Exception) -> str:
@@ -172,6 +175,10 @@ def run(
         "cells", "--preview",
         help="When to prompt: 'always' (every cell), 'cells' (cells with side effects, default), 'never'.",
     ),
+    no_dry_run: bool = typer.Option(
+        False, "--no-dry-run",
+        help="Skip dry-run overlay execution; use static AST analysis only for previews.",
+    ),
     debug: bool = typer.Option(False, "--debug", help="Show full tracebacks on errors."),
 ) -> None:
     """Run the agent on one task and exit."""
@@ -181,7 +188,10 @@ def run(
         raise typer.Exit(2)
 
     try:
-        with _run_session(workspace=workspace, auto=auto, preview=preview) as s:
+        with _run_session(
+            workspace=workspace, auto=auto, preview=preview,
+            dry_run=not no_dry_run,
+        ) as s:
             console.print(f"[dim]session {s.session_id} · workspace {s.workspace}[/]")
             console.print(f"[dim]driver: {s.router.roles['driver'].primary} · "
                           f"skills: {len(s.skills.skills)} · mode: {s.mode}/"
@@ -221,6 +231,7 @@ def chat(
     workspace: Path = typer.Option(Path("."), "--cwd", "-C"),
     auto: bool = typer.Option(False, "--auto"),
     preview: str = typer.Option("cells", "--preview"),
+    no_dry_run: bool = typer.Option(False, "--no-dry-run"),
     debug: bool = typer.Option(False, "--debug"),
     no_stream: bool = typer.Option(
         False, "--no-stream",
@@ -236,7 +247,10 @@ def chat(
     from forge.repl import is_slash_command, make_session
 
     try:
-        with _run_session(workspace=workspace, auto=auto, preview=preview, is_chat=True) as s:
+        with _run_session(
+            workspace=workspace, auto=auto, preview=preview,
+            dry_run=not no_dry_run, is_chat=True,
+        ) as s:
             console.print(f"[dim]forge chat · {s.session_id} · {s.workspace}[/]")
             console.print(
                 f"[dim]Esc-Enter to submit · Enter for newline · "
