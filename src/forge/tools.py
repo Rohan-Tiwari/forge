@@ -333,6 +333,12 @@ _FIND_SKILL: Callable[[str], list[dict[str, Any]]] = lambda q: []
 _RUN_SKILL: Callable[..., Any] = lambda *a, **kw: (_ for _ in ()).throw(
     RuntimeError("run_skill not wired; install via forge.tools.set_skill_runtime()")
 )
+_CALL_MCP: Callable[..., Any] = lambda *a, **kw: (_ for _ in ()).throw(
+    RuntimeError(
+        "call_mcp not wired. Configure servers in ~/.forge/mcp.toml; the "
+        "Session wires this on start()."
+    )
+)
 
 
 def see(image: str | os.PathLike[str] | bytes,
@@ -462,23 +468,36 @@ def run_skill(name: str, **kwargs: Any) -> Any:
     return _RUN_SKILL(name, **kwargs)
 
 
+def call_mcp(server: str, tool: str, **arguments: Any) -> Any:
+    """Invoke a tool on a configured MCP server.
+
+    The Session wires this on start() to its MCPRegistry. Configure servers
+    in `~/.forge/mcp.toml`. Servers are spawned lazily on first call and
+    torn down on Session.close.
+    """
+    return _CALL_MCP(server, tool, **arguments)
+
+
 def set_skill_runtime(
     *,
     find: Optional[Callable[[str], list[dict[str, Any]]]] = None,
     run: Optional[Callable[..., Any]] = None,
     see_fn: Optional[Callable[[Any], str]] = None,  # deprecated; see() is real now
+    mcp: Optional[Callable[..., Any]] = None,
 ) -> None:
-    """Wire the skill callbacks. Called by Session.start().
+    """Wire the skill / MCP callbacks. Called by Session.start().
 
     Note: `see_fn` is no longer used — see() is now a real implementation
     that talks to the vision sub-skill via the Ollama API directly. The
     parameter is kept for backward compatibility and ignored.
     """
-    global _FIND_SKILL, _RUN_SKILL
+    global _FIND_SKILL, _RUN_SKILL, _CALL_MCP
     if find is not None:
         _FIND_SKILL = find
     if run is not None:
         _RUN_SKILL = run
+    if mcp is not None:
+        _CALL_MCP = mcp
     # see_fn intentionally ignored — see() is wired directly to Ollama now.
 
 
@@ -650,6 +669,7 @@ def kernel_globals() -> dict[str, Any]:
         "see": see,
         "find_skill": find_skill,
         "run_skill": run_skill,
+        "call_mcp": call_mcp,
         # Convenience re-exports
         "ProtectedPathError": ProtectedPathError,
         "ProtectedActionError": ProtectedActionError,

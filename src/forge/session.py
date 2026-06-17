@@ -33,6 +33,7 @@ from forge.audit import AuditLog, SessionLog, new_session_id
 from forge.config import audit_log as audit_log_path, ensure_dirs
 from forge.gate import GateAction, GateDecision, check, parse_cell
 from forge.kernel import Kernel, Observation
+from forge.mcp import MCPRegistry
 from forge.permissions import Action, PermissionStore, actions_for_preview
 from forge.preview import Preview
 from forge.router import Completion, ModelRouter
@@ -105,6 +106,7 @@ class Session:
         self.router = ModelRouter()
         self.skills = SkillRegistry.scan()
         self.permissions = PermissionStore.load()
+        self.mcp = MCPRegistry()  # loads ~/.forge/mcp.toml lazily
         self.session_id = new_session_id()
         self.log = SessionLog(self.audit, self.session_id)
 
@@ -125,10 +127,11 @@ class Session:
         self.kernel.start()
         self.shadow.init()
 
-        # Wire skill callbacks.
+        # Wire skill + MCP callbacks.
         tools.set_skill_runtime(
             find=self.skills.find,
             run=self._run_skill,
+            mcp=self.mcp.call,
         )
 
         self._system_prompt = self._build_system_prompt()
@@ -140,6 +143,7 @@ class Session:
             mode=self.mode,
             preview_mode=self.preview_mode,
             skills=len(self.skills.skills),
+            mcp_servers=len(self.mcp.configs),
             driver_model=self.router.roles["driver"].primary,
         )
 
@@ -151,6 +155,10 @@ class Session:
             calls=len(self.router.calls),
         )
         self.kernel.stop()
+        try:
+            self.mcp.close_all()
+        except Exception:  # noqa: BLE001 — never let MCP cleanup mask user errors
+            pass
 
     # ---- helpers --------------------------------------------------------
 
