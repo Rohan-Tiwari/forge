@@ -86,6 +86,7 @@ class Session:
         mode: str = "interactive",      # "interactive" | "auto" | "plan"
         preview: PreviewMode = "cells",   # "always" | "cells" | "never"
         dry_run: bool = True,             # use overlay dry-run for previews
+        sandboxed: bool = True,           # wrap kernel in sandbox-exec on macOS
         max_cells_per_turn: int = 12,
         max_format_retries: int = 2,
         max_empty_retries: int = 1,
@@ -95,6 +96,7 @@ class Session:
         self.mode = mode
         self.preview_mode = preview
         self.dry_run = dry_run
+        self.sandboxed = sandboxed
         self.max_cells_per_turn = max_cells_per_turn
         self.max_format_retries = max_format_retries
         self.max_empty_retries = max_empty_retries
@@ -102,7 +104,7 @@ class Session:
 
         ensure_dirs(self.workspace)
 
-        self.kernel = Kernel(workspace=self.workspace)
+        self.kernel = Kernel(workspace=self.workspace, sandboxed=sandboxed)
         self.shadow = ShadowGit(workspace=self.workspace)
         self.audit = AuditLog(audit_log_path(self.workspace))
         self.router = ModelRouter()

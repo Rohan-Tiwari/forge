@@ -239,18 +239,25 @@ class Kernel:
     Threadsafe: concurrent execute() calls serialize on a lock so they
     don't cross-talk. Drainer threads are bound to their specific Popen
     so a stop()→start() cycle doesn't leak readers.
+
+    On macOS, the worker subprocess can be wrapped in a sandbox-exec
+    profile (forge.sandbox) that limits FS writes + network. Pass
+    `sandboxed=True` (default) to enable; the wrapping is automatic and
+    silently no-ops on platforms that don't support it.
     """
 
-    def __init__(self, *, workspace: Path):
+    def __init__(self, *, workspace: Path, sandboxed: bool = True):
         self.workspace = workspace.resolve()
+        self.sandboxed = sandboxed
         self.proc: Optional[subprocess.Popen[str]] = None
         self.health = KernelHealth()
         self._stderr_buf: deque[str] = deque(maxlen=1000)
         self._stderr_thread: Optional[threading.Thread] = None
-        self._result_pipe_r: Optional[int] = None  # fd 3 read end (parent)
-        self._result_reader: Optional[Any] = None  # type: ignore[name-defined]
+        self._result_pipe_r: Optional[int] = None
+        self._result_reader: Optional[Any] = None
         self._exec_lock = threading.Lock()
         self._next_nonce = 0
+        self._sandbox_profile_path: Optional[Path] = None
 
     def _new_nonce(self) -> str:
         self._next_nonce += 1
@@ -273,9 +280,26 @@ class Kernel:
         env["FORGE_RESULT_FD"] = str(result_w)
         env["PYTHONUNBUFFERED"] = "1"
 
+        # Build the command. If sandboxing is on AND supported, wrap with
+        # sandbox-exec. Profile is bound to the current workspace.
+        base_cmd = [sys.executable, "-u", "-c", _WORKER_SCRIPT]
+        if self.sandboxed:
+            from forge.sandbox import wrap_command
+            cmd, profile_path = wrap_command(
+                base_cmd,
+                workspace=self.workspace,
+                # Default allowlist: ollama localhost. Skills can extend via
+                # MCP server config or a future router.toml network section.
+                allowed_network_hosts=["localhost", "127.0.0.1"],
+            )
+            self._sandbox_profile_path = profile_path
+        else:
+            cmd = base_cmd
+            self._sandbox_profile_path = None
+
         try:
             proc = subprocess.Popen(  # noqa: S603
-                [sys.executable, "-u", "-c", _WORKER_SCRIPT],
+                cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -349,6 +373,14 @@ class Kernel:
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=2)
             self._stderr_thread = None
+
+        # Clean up the sandbox-exec profile we wrote to /tmp
+        if self._sandbox_profile_path is not None:
+            try:
+                self._sandbox_profile_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._sandbox_profile_path = None
 
         self.proc = None
 
