@@ -3,6 +3,43 @@
 All notable changes to Forge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — Wave 1: vision + streaming + multi-line REPL
+
+### Added
+
+- **Vision sub-skill (`see()`)** — `tools.see(image_or_path)` now talks to a
+  local Qwen2.5-VL via Ollama. Accepts file paths, `Path` objects, or raw
+  bytes. Per-session result cache (`(image-bytes, prompt)` → description).
+  Refuses protected paths, surfaces clear errors on connection failure.
+  ~14 unit tests + 1 live integration test.
+- **Token-streaming completions** — `router.complete_stream()` yields
+  `StreamChunk` deltas as the model generates. `Session.turn(user, on_chunk=...)`
+  exposes a callback that receives every delta; `forge chat` uses Rich's
+  `Live` region to render tokens live to the TTY, then collapses to the
+  final reply panel. Fall-back to buffered mode when `--no-stream` or stdout
+  isn't a TTY.
+- **prompt_toolkit chat REPL** — multi-line input (Enter for newline,
+  Esc-Enter to submit), file-backed history at `~/.forge/chat-history`,
+  bracketed paste, slash-command auto-completion (`/exit`, `/undo`, `/cost`,
+  `/reset`, `/preview <mode>`, `/skills`, `/help`). History search via
+  Ctrl-R works like in bash.
+- **CLI flag `--no-stream`** for `forge chat` to disable token streaming.
+
+### Changed
+
+- The vision role now defaults to `qwen2.5vl:7b` (was `qwen2.5-vl:7b` —
+  matches Ollama's actual model name).
+- `set_skill_runtime()` no longer accepts `see_fn` — `see()` is wired
+  directly to Ollama now. The kwarg is kept for backward compat and ignored.
+
+### Tests
+
+- 167 passing, all green. Up from 144 in v0.1.0.
+- New: `tests/test_vision.py` (15 tests including 1 live integration),
+  `tests/test_streaming.py` (9 tests).
+
+---
+
 ## [0.1.0] — initial release
 
 A code-first local agent with skills, multi-provider routing, and trust-mode

@@ -333,14 +333,123 @@ _FIND_SKILL: Callable[[str], list[dict[str, Any]]] = lambda q: []
 _RUN_SKILL: Callable[..., Any] = lambda *a, **kw: (_ for _ in ()).throw(
     RuntimeError("run_skill not wired; install via forge.tools.set_skill_runtime()")
 )
-_SEE: Callable[[str | os.PathLike[str] | bytes], str] = lambda img: (_ for _ in ()).throw(
-    RuntimeError("see() not wired; configure a vision model in router.toml")
-)
 
 
-def see(image: str | os.PathLike[str] | bytes) -> str:
-    """Pass an image to the vision sub-skill. Returns a structured description."""
-    return _SEE(image)
+def see(image: str | os.PathLike[str] | bytes,
+        *,
+        prompt: str = "Describe this image. Include any text, structure, key elements, and notable details.",
+        model: str | None = None,
+        ollama_url: str | None = None,
+        timeout: float = 120.0) -> str:
+    """Pass an image to the local vision model. Returns a text description.
+
+    Accepts:
+      - str / Path: a path to an image file (PNG, JPEG, GIF, WEBP, BMP).
+        Tilde-expansion and protected-path checks apply (we refuse to read
+        from `~/.ssh/*` etc., consistent with Read()).
+      - bytes: raw image bytes.
+
+    The model is the `vision` role's primary in the router config (default
+    `qwen2.5vl:7b`). Override with the `model` kwarg or set FORGE_VISION_MODEL.
+
+    Returns the model's text description as a string. Raises RuntimeError on
+    HTTP/parse errors so callers can decide whether to retry or fall back.
+
+    Caching: identical (image-bytes, prompt) pairs within a session return
+    the cached description. Saves both wall-clock and the model's wakeup cost.
+    """
+    import base64
+    import hashlib
+    import json as _json
+    import os as _os
+    import time
+    import urllib.request
+
+    # ---- resolve input to bytes ------------------------------------------
+    if isinstance(image, bytes):
+        img_bytes = image
+        src_label = f"<{len(image)} bytes>"
+    else:
+        path = _expand(image)
+        # Reads of protected paths are blocked even for vision — consistent
+        # with Read() and the post-shake-out hardening.
+        if is_protected_path(path):
+            raise ProtectedPathError(f"refusing to read protected path: {image}")
+        if not path.exists():
+            raise FileNotFoundError(f"no such image: {image}")
+        if path.is_dir():
+            raise IsADirectoryError(f"is a directory: {image}")
+        img_bytes = path.read_bytes()
+        src_label = str(path)
+
+    if len(img_bytes) > 20 * 1024 * 1024:  # 20 MB cap to be safe
+        raise ValueError(
+            f"image too large: {len(img_bytes)} bytes (max 20 MB). "
+            f"Resize before calling see()."
+        )
+
+    # ---- cache lookup ----------------------------------------------------
+    cache_key = hashlib.sha256(img_bytes + prompt.encode("utf-8")).hexdigest()
+    cache = _SEE_CACHE
+    if cache_key in cache:
+        return cache[cache_key]
+
+    # ---- POST to Ollama --------------------------------------------------
+    model_name = model or _os.environ.get("FORGE_VISION_MODEL", "qwen2.5vl:7b")
+    base_url = ollama_url or _os.environ.get(
+        "FORGE_OLLAMA_URL", "http://localhost:11434/v1"
+    )
+    # Strip /v1 if present — vision needs the native /api/chat endpoint
+    # (the OpenAI-shaped /v1/chat/completions doesn't accept Ollama's image
+    # field shape).
+    api_base = base_url.rsplit("/v1", 1)[0]
+    api_url = api_base.rstrip("/") + "/api/chat"
+
+    payload = {
+        "model": model_name,
+        "messages": [{
+            "role": "user",
+            "content": prompt,
+            "images": [base64.b64encode(img_bytes).decode("ascii")],
+        }],
+        "stream": False,
+        "options": {"temperature": 0.0},
+    }
+    req = urllib.request.Request(
+        api_url,
+        data=_json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = _json.load(resp)
+    except urllib.error.HTTPError as e:  # type: ignore[attr-defined]
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(
+            f"vision model {model_name} returned HTTP {e.code}: {body}"
+        ) from e
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(
+            f"vision model unreachable at {api_url}: {e}. "
+            f"Is `ollama serve` running? Did you `ollama pull {model_name}`?"
+        ) from e
+
+    description = data.get("message", {}).get("content", "").strip()
+    if not description:
+        raise RuntimeError(
+            f"vision model returned empty description for {src_label}"
+        )
+
+    cache[cache_key] = description
+    return description
+
+
+# Per-session image cache (cleared on Session lifecycle by importing module reload).
+# We keep it module-scoped because see() is a global — callers don't have a
+# session handle. The Session.close() implementation could clear this, but
+# v0 lets it grow within a Python interpreter lifetime.
+_SEE_CACHE: dict[str, str] = {}
 
 
 def find_skill(query: str) -> list[dict[str, Any]]:
@@ -357,16 +466,20 @@ def set_skill_runtime(
     *,
     find: Optional[Callable[[str], list[dict[str, Any]]]] = None,
     run: Optional[Callable[..., Any]] = None,
-    see_fn: Optional[Callable[[Any], str]] = None,
+    see_fn: Optional[Callable[[Any], str]] = None,  # deprecated; see() is real now
 ) -> None:
-    """Wire the skill/vision callbacks. Called by Session.start()."""
-    global _FIND_SKILL, _RUN_SKILL, _SEE
+    """Wire the skill callbacks. Called by Session.start().
+
+    Note: `see_fn` is no longer used — see() is now a real implementation
+    that talks to the vision sub-skill via the Ollama API directly. The
+    parameter is kept for backward compatibility and ignored.
+    """
+    global _FIND_SKILL, _RUN_SKILL
     if find is not None:
         _FIND_SKILL = find
     if run is not None:
         _RUN_SKILL = run
-    if see_fn is not None:
-        _SEE = see_fn
+    # see_fn intentionally ignored — see() is wired directly to Ollama now.
 
 
 # =============================================================================

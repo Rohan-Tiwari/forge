@@ -221,49 +221,87 @@ def chat(
     auto: bool = typer.Option(False, "--auto"),
     preview: str = typer.Option("cells", "--preview"),
     debug: bool = typer.Option(False, "--debug"),
+    no_stream: bool = typer.Option(
+        False, "--no-stream",
+        help="Disable token streaming (buffer the full response before showing).",
+    ),
 ) -> None:
     """Open an interactive REPL with the agent."""
     if preview not in {"always", "cells", "never"}:
         err_console.print(f"[red]invalid --preview value:[/] {preview!r}")
         raise typer.Exit(2)
 
+    # Lazy imports — keep `forge --help` and one-shot `forge run` snappy.
+    from forge.repl import is_slash_command, make_session
+
     try:
         with _run_session(workspace=workspace, auto=auto, preview=preview, is_chat=True) as s:
             console.print(f"[dim]forge chat · {s.session_id} · {s.workspace}[/]")
             console.print(
-                f"[dim]Ctrl-D or /exit to quit · /undo to revert · /cost · "
-                f"/reset · /preview <mode>[/]"
+                f"[dim]Esc-Enter to submit · Enter for newline · "
+                f"Ctrl-D / /exit to quit · /undo /cost /reset /preview /skills[/]"
             )
+            prompt_session = make_session(
+                extra_completions=[s.name for s in s.skills.skills],
+            )
+
             while True:
                 try:
-                    user = console.input("[bold cyan]you ▸[/] ").strip()
+                    user = prompt_session.prompt().strip()
                 except (EOFError, KeyboardInterrupt):
                     console.print()
                     break
                 if not user:
                     continue
-                if user in {"/exit", "/quit"}:
-                    break
-                if user == "/undo":
-                    _do_undo(s.workspace)
+
+                # ---- slash commands ----
+                if is_slash_command(user):
+                    cmd, *rest = user.split(maxsplit=1)
+                    arg = rest[0] if rest else ""
+                    if cmd in {"/exit", "/quit"}:
+                        break
+                    if cmd == "/undo":
+                        _do_undo(s.workspace)
+                        continue
+                    if cmd == "/cost":
+                        console.print(s.router.cost_summary())
+                        continue
+                    if cmd == "/reset":
+                        obs = s.kernel.reset()
+                        console.print(f"[dim]{obs.result}[/]")
+                        continue
+                    if cmd == "/preview":
+                        if arg in {"always", "cells", "never"}:
+                            s.preview_mode = arg
+                            console.print(f"[dim]preview mode: {arg}[/]")
+                        else:
+                            console.print(
+                                f"[red]usage: /preview <always|cells|never>[/]"
+                            )
+                        continue
+                    if cmd == "/skills":
+                        for sk in s.skills.skills:
+                            console.print(f"  [bold]{sk.name}[/]: {sk.description[:80]}")
+                        if not s.skills.skills:
+                            console.print("[dim]no skills installed[/]")
+                        continue
+                    if cmd == "/help":
+                        console.print(
+                            "[bold]commands:[/]\n"
+                            "  /undo        revert last cell\n"
+                            "  /cost        show session cost\n"
+                            "  /reset       clear kernel globals\n"
+                            "  /preview <m> set preview to always|cells|never\n"
+                            "  /skills      list installed skills\n"
+                            "  /exit        quit"
+                        )
+                        continue
+                    console.print(f"[red]unknown command: {cmd}[/]")
                     continue
-                if user == "/cost":
-                    console.print(s.router.cost_summary())
-                    continue
-                if user == "/reset":
-                    obs = s.kernel.reset()
-                    console.print(f"[dim]{obs.result}[/]")
-                    continue
-                if user.startswith("/preview "):
-                    new = user.split(maxsplit=1)[1].strip()
-                    if new in {"always", "cells", "never"}:
-                        s.preview_mode = new
-                        console.print(f"[dim]preview mode: {new}[/]")
-                    else:
-                        console.print(f"[red]invalid preview mode: {new!r}[/]")
-                    continue
+
+                # ---- normal turn ----
                 try:
-                    result = s.turn(user)
+                    result = _run_turn_with_stream(s, user, no_stream=no_stream)
                 except KeyboardInterrupt:
                     console.print("[yellow](turn interrupted)[/]")
                     continue
@@ -272,6 +310,7 @@ def chat(
                         raise
                     console.print(_format_user_error(e))
                     continue
+
                 console.print()
                 console.print(Panel(
                     result.final_text or "(no reply)",
@@ -283,6 +322,40 @@ def chat(
             raise
         err_console.print(_format_user_error(e))
         raise typer.Exit(1)
+
+
+def _run_turn_with_stream(s: "Session", user: str, *, no_stream: bool):
+    """Run a turn with optional token streaming to the TTY.
+
+    Streaming uses a Rich Live region that updates token-by-token, then
+    is replaced by the final reply Panel. Falls back to buffered mode
+    when --no-stream is set or when stdout isn't a TTY (CI, redirected).
+    """
+    if no_stream or not sys.stdout.isatty():
+        return s.turn(user)
+
+    from rich.live import Live
+    from rich.panel import Panel as RichPanel
+    from rich.text import Text
+
+    accumulated: list[str] = []
+    title = f"[dim]{s.router.roles['driver'].primary} · streaming…[/]"
+
+    def render() -> RichPanel:
+        return RichPanel(
+            Text("".join(accumulated)) if accumulated else Text("…", style="dim"),
+            title=title, border_style="dim",
+        )
+
+    with Live(render(), console=console, refresh_per_second=24,
+              transient=True) as live:
+        def on_chunk(delta: str) -> None:
+            accumulated.append(delta)
+            live.update(render())
+        result = s.turn(user, on_chunk=on_chunk)
+    # The Live block has erased the streaming panel; the final reply Panel
+    # is printed by the chat loop right after this returns.
+    return result
 
 
 # =============================================================================

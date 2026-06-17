@@ -16,6 +16,10 @@ Design rules followed here:
   * Preview-and-confirm runs BEFORE execution for any cell with side
     effects (writes, network, Bash) in interactive mode. Pre-approved
     actions in the PermissionStore skip the prompt.
+  * Optional streaming: pass `on_chunk=callable(delta_str)` to turn() and the
+    model's output streams to that callback as it arrives. The gate still
+    runs on the FULL content after the stream ends — streaming is purely a
+    UX layer for the user-visible prose.
   * The Session is sync. Streaming + async is a v0.2 concern.
 """
 from __future__ import annotations
@@ -23,7 +27,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from forge.audit import AuditLog, SessionLog, new_session_id
 from forge.config import audit_log as audit_log_path, ensure_dirs
@@ -41,6 +45,7 @@ SYSTEM_PROMPT_PATH = Path(__file__).parent / "system_prompt.md"
 
 
 PreviewMode = str  # "always" | "cells" | "never"
+ChunkCallback = Callable[[str], None]   # called with each delta of streamed content
 
 
 @dataclass
@@ -201,8 +206,18 @@ class Session:
 
     # ---- the agent loop -------------------------------------------------
 
-    def turn(self, user_msg: str) -> TurnResult:
-        """Run one user-turn worth of the perceive-plan-execute loop."""
+    def turn(
+        self,
+        user_msg: str,
+        *,
+        on_chunk: Optional[ChunkCallback] = None,
+    ) -> TurnResult:
+        """Run one user-turn worth of the perceive-plan-execute loop.
+
+        If `on_chunk` is provided, each model completion streams via
+        router.complete_stream() and the callback receives every delta as
+        it arrives. The gate runs on the FULL content after the stream ends.
+        """
         self._history.append({"role": "user", "content": user_msg})
         self._maybe_truncate_history()
         result = TurnResult()
@@ -212,7 +227,7 @@ class Session:
 
         for cell_idx in range(self.max_cells_per_turn):
             try:
-                completion = self.router.complete(self._history, role="driver")
+                completion = self._call_driver(on_chunk)
             except Exception as e:  # noqa: BLE001 — surface gracefully
                 self.log.write("model.error", error=str(e))
                 result.final_text = f"(model call failed: {e})"
@@ -389,6 +404,36 @@ class Session:
         return result
 
     # ---- preview / confirm hooks ----------------------------------------
+
+    def _call_driver(self, on_chunk: Optional[ChunkCallback]) -> Completion:
+        """Single driver-role completion. Streams via on_chunk if provided.
+
+        Whether streaming or not, returns a fully-populated Completion. The
+        gate works on completion.content; the streaming is only for visible
+        UX. This separation is what keeps the safety story honest — the
+        gate sees the same artifact regardless of whether the user watched
+        it appear token-by-token.
+        """
+        if on_chunk is None:
+            return self.router.complete(self._history, role="driver")
+
+        # Streaming path — accumulate via complete_stream and forward deltas.
+        final: Optional[Completion] = None
+        for chunk in self.router.complete_stream(self._history, role="driver"):
+            if chunk.delta:
+                try:
+                    on_chunk(chunk.delta)
+                except Exception:  # noqa: BLE001 — never let the UX break the loop
+                    pass
+            if chunk.is_final:
+                final = chunk.completion
+        if final is None:
+            # Stream produced no final chunk — should never happen but be safe.
+            return Completion(
+                content="", role_used="driver", model_used="unknown",
+                elapsed_s=0.0, finish_reason="error: stream produced no final chunk",
+            )
+        return final
 
     def _needs_confirmation(self, preview: Preview, gate: GateDecision) -> bool:
         """Decide whether to prompt the user before running this cell.

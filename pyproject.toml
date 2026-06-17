@@ -31,6 +31,7 @@ dependencies = [
     "ipykernel>=6.29",
     "httpx>=0.27",
     "tomli-w>=1.0",          # writing ~/.forge/permissions.toml
+    "prompt_toolkit>=3.0",   # multi-line chat REPL with history + completion
 ]
 
 [project.optional-dependencies]

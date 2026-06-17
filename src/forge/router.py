@@ -4,7 +4,7 @@ Five named roles, each with a primary model and an escalation chain:
 
     driver      — main agent loop. Default: gpt-oss:20b on Ollama.
     planner     — pre-execution plan (Plan mode). Default: claude-sonnet (TODO v0.2).
-    vision      — see() sub-skill. Default: qwen2.5-vl on Ollama (TODO v0.2).
+    vision      — see() sub-skill. Default: qwen2.5vl on Ollama.
     classifier  — auto-mode safety check. Default: gpt-oss:20b at low effort.
     summarizer  — context truncation. Default: gpt-oss:20b at low effort.
 
@@ -17,6 +17,11 @@ The Day 0 system-prompt fixes are baked into `complete()`:
   * The system prompt explicitly forbids tool calls
   * No tools are passed in the request (so harmony tool-channel can't trigger)
 
+Two completion APIs:
+  * `complete(messages, role=...)` returns a Completion when done (buffered).
+  * `complete_stream(messages, role=...)` yields StreamChunk objects as content
+    arrives. Use this for the chat REPL where tokens should appear live.
+
 To swap providers, edit `~/.forge/router.toml` (or set FORGE_DRIVER_MODEL).
 """
 from __future__ import annotations
@@ -24,7 +29,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterator, Optional
 
 from openai import OpenAI
 
@@ -57,6 +62,16 @@ class Completion:
     @property
     def empty(self) -> bool:
         return not self.content.strip()
+
+
+@dataclass
+class StreamChunk:
+    """One delta from a streaming completion. Yielded by complete_stream."""
+
+    delta: str                          # the text fragment in this chunk
+    accumulated: str                    # full content so far (delta included)
+    is_final: bool = False              # True on the last chunk
+    completion: Optional[Completion] = None  # populated on the final chunk
 
 
 # Cost per 1M tokens (input, output). Used by the router for the session
@@ -99,7 +114,7 @@ def default_roles() -> dict[str, RoleConfig]:
         "classifier": RoleConfig(primary=DEFAULT_DRIVER_MODEL, effort="low"),
         "summarizer": RoleConfig(primary=DEFAULT_DRIVER_MODEL, effort="low"),
         "planner": RoleConfig(primary=DEFAULT_DRIVER_MODEL, effort="high"),
-        "vision": RoleConfig(primary="qwen2.5-vl:7b"),
+        "vision": RoleConfig(primary="qwen2.5vl:7b"),
     }
 
 
@@ -215,3 +230,147 @@ class ModelRouter:
             return comp
 
         raise RuntimeError(f"all model attempts failed; last error: {last_err}")
+
+    # ---- streaming ------------------------------------------------------
+
+    def complete_stream(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        role: str = "driver",
+        max_tokens: int = 2048,
+    ) -> Iterator[StreamChunk]:
+        """Streaming variant of complete(). Yields StreamChunk per token batch.
+
+        The final chunk has `is_final=True` and `completion` populated with
+        the same Completion object you'd get from `complete()` — same
+        accounting, same audit-trail data.
+
+        Falls through the escalation chain just like complete(): on a
+        network/parse error mid-stream we DO surface the partial content
+        we've seen so far in the final chunk's stderr-equivalent (in the
+        completion's `finish_reason='error'`), but we don't retry on a
+        different model mid-stream — that would mean the user sees text from
+        two different models concatenated, which is confusing. Retry happens
+        BEFORE the first chunk only.
+
+        For determinism in tests, this method calls itself only via
+        `self.ollama.chat.completions.create(stream=True, ...)`. A FakeRouter
+        in tests can override.
+        """
+        if self.spent_usd >= self.cost_ceiling_usd:
+            raise CostCeilingExceeded(
+                f"session has spent ${self.spent_usd:.2f} of "
+                f"${self.cost_ceiling_usd:.2f} ceiling"
+            )
+
+        cfg = self.roles.get(role)
+        if cfg is None:
+            raise ValueError(f"unknown role: {role!r}")
+
+        attempt_models = [cfg.primary, *cfg.escalation]
+        last_err: Optional[Exception] = None
+        stream = None
+        chosen_model = ""
+
+        # Find a working model first (no chunks yielded until we have a stream).
+        for model in attempt_models:
+            try:
+                stream = self.ollama.chat.completions.create(
+                    model=model,
+                    messages=messages,  # type: ignore[arg-type]
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    extra_body={
+                        "think": False,
+                        "reasoning_effort": cfg.effort,
+                        "options": {"num_ctx": cfg.num_ctx},
+                        "keep_alive": os.environ.get("FORGE_KEEP_ALIVE", "24h"),
+                    },
+                )
+                chosen_model = model
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+
+        if stream is None:
+            raise RuntimeError(f"all model attempts failed; last error: {last_err}")
+
+        accumulated: list[str] = []
+        in_tokens = 0
+        out_tokens = 0
+        finish_reason = ""
+        t0 = time.monotonic()
+
+        try:
+            for chunk in stream:
+                # Track usage if the provider sent it (only on the final chunk
+                # for OpenAI-shaped streams with include_usage=True).
+                if getattr(chunk, "usage", None):
+                    in_tokens = chunk.usage.prompt_tokens or in_tokens
+                    out_tokens = chunk.usage.completion_tokens or out_tokens
+
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                delta = ""
+                if choice.delta and choice.delta.content:
+                    delta = choice.delta.content
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+                if delta:
+                    accumulated.append(delta)
+                    yield StreamChunk(
+                        delta=delta,
+                        accumulated="".join(accumulated),
+                        is_final=False,
+                    )
+        except Exception as e:  # noqa: BLE001
+            # Stream broke mid-flight — surface what we have.
+            partial = "".join(accumulated)
+            comp = Completion(
+                content=partial,
+                role_used=role,
+                model_used=chosen_model,
+                elapsed_s=time.monotonic() - t0,
+                prompt_tokens=in_tokens,
+                completion_tokens=out_tokens,
+                cost_usd=_price(chosen_model, in_tokens, out_tokens),
+                finish_reason=f"error: {e}",
+            )
+            self.calls.append(comp)
+            self.spent_usd += comp.cost_usd
+            yield StreamChunk(
+                delta="",
+                accumulated=partial,
+                is_final=True,
+                completion=comp,
+            )
+            return
+
+        # Normal end-of-stream.
+        elapsed = time.monotonic() - t0
+        full_content = "".join(accumulated)
+        cost = _price(chosen_model, in_tokens, out_tokens)
+        comp = Completion(
+            content=full_content,
+            role_used=role,
+            model_used=chosen_model,
+            elapsed_s=elapsed,
+            prompt_tokens=in_tokens,
+            completion_tokens=out_tokens,
+            cost_usd=cost,
+            finish_reason=finish_reason,
+        )
+        self.calls.append(comp)
+        self.spent_usd += cost
+        yield StreamChunk(
+            delta="",
+            accumulated=full_content,
+            is_final=True,
+            completion=comp,
+        )
