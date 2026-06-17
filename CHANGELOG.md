@@ -3,6 +3,101 @@
 All notable changes to Forge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — Waves 2 + 3: real escalation, MCP, skill installer, dry-run, sandbox
+
+### Wave 2a — Multi-provider router with real escalation (commit 666fd35)
+
+- **`forge.providers`** module — Provider Protocol with three implementations:
+  - `OllamaProvider` (default catch-all, talks to `localhost:11434/v1`)
+  - `AnthropicProvider` — `claude-*` models via the official anthropic SDK; reads `ANTHROPIC_API_KEY`
+  - `OpenAIProvider` — `gpt-*` / `o3-*` / `o4-*` via openai SDK; reads `OPENAI_API_KEY`
+  - All three implement both `complete()` and `complete_stream()`
+- **`router.py`** is now a thin orchestrator over the provider chain:
+  - Picks first provider whose `handles(model_id)` returns True
+  - Walks role's escalation chain on errors
+  - Per-provider cost accounting in `cost_summary().by_provider`
+  - **Auto-detects API keys**: if `ANTHROPIC_API_KEY` is set, `claude-sonnet-4-6` is appended to driver's escalation chain. Same for OpenAI.
+- **Escalation triggers** — wired in `session.turn()`:
+  - 2× consecutive intent-mismatch → next call escalates
+  - 2× consecutive parse-format-fail → next call escalates
+  - `/escalate` slash command → explicit, one-shot
+  - Successful cell resets escalation state
+- Tests: 24 new (`test_router_providers.py`)
+
+### Wave 2b — MCP integration (commit 1a9f486)
+
+- **`forge.mcp`** module — stdio MCP client (~430 LOC, no third-party SDK):
+  - JSON-RPC 2.0 over stdin/stdout
+  - Initialize handshake (protocol version 2024-11-05)
+  - Lazy server spawn on first `call_mcp(...)`
+  - Per-server lock serializes concurrent tool calls
+  - Background stderr drainer prevents pipe blocking
+  - Tool list cached after handshake
+  - Error responses (isError) raise `MCPCallError`
+- **`call_mcp(server, tool, **args)`** is now a real kernel global. Wired by `Session.start()` from `MCPRegistry`.
+- Configure servers in `~/.forge/mcp.toml`:
+  ```toml
+  [servers.gh]
+  cmd = "npx"
+  args = ["-y", "@modelcontextprotocol/server-github"]
+  ```
+- Tests: 20 new (`test_mcp.py`) — including a tiny in-process fake JSON-RPC server.
+
+### Wave 3a — Skill installer + AST scanner (commit 5dbe7db)
+
+- **`forge.installer`** module + `forge skill install` / `forge skill diff`:
+  - Spec parsing: `alice/repo@sha`, full `https://...` URL, `git@host:path` SSH form, `:subdir` selector
+  - **Refuses floating refs** (main, master, HEAD, develop) without `--pin`
+  - Content-addressed pinning to `~/.skills/installed/<source>/<name>@<sha>/`
+  - **AST scanner** flags at install time: `eval`, `exec`, `compile`, `os.system`, `subprocess.*`, `getattr(__builtins__, ...)`, `import ctypes`
+  - 5-second cooldown before confirmation prompt (anti-muscle-memory)
+  - Critical findings → red warning before confirm prompt
+  - Manifest at `~/.skills/manifest.toml` round-tripped via tomllib + tomli_w
+- Tests: 39 new (`test_installer.py`) — including end-to-end installs from real local git repos built per test.
+
+### Wave 3b — Dry-run preview engine (commit d2dec5e)
+
+- **`Preview.from_dry_run()`** replaces static AST-only previews with REAL diffs:
+  - Copies workspace → overlay tmpdir (skipping `.git`, `.forge`, `__pycache__`, `.venv`, `node_modules`)
+  - Runs the cell in a fresh subprocess with `cwd=overlay`
+  - **Stubs Bash + network** so dry-run is filesystem-only
+  - Walks both trees afterward; computes unified diffs for create/modify/delete
+  - Discards overlay; **nothing in the user's workspace changed**
+- New `delete` `FileChange.kind` for files the cell removes (red `-` marker in render)
+- `Session(dry_run=True)` (default) — falls back silently to static for syntax errors, oversized workspaces (>50MB), or subprocess crashes
+- CLI: `--no-dry-run` flag on both `forge run` and `forge chat`
+- Tests: 12 new (`test_dry_run.py`) — including the safety invariant *"dry-run doesn't touch the real workspace"*.
+
+### Wave 3c — Real macOS sandbox-exec boundary (commit a519c5b)
+
+- **`forge.sandbox`** module — generates sandbox-exec TinyScheme profiles:
+  - `deny default`
+  - `file-write*` only to: workspace, `~/.forge`, `~/.skills`, `/tmp`, `__pycache__/*.pyc`
+  - `file-read*` allowed (in-process protected-paths handles read exfil)
+  - `process-fork` + `process-exec*` allowed for `/bin/sh`, `/usr/bin/*`, `/opt/homebrew/*`
+  - `network-bind` only on localhost; outbound denied unless `allowed_network_hosts` is non-empty
+- **`Kernel(sandboxed=True)`** (default) wraps the worker subprocess in `sandbox-exec`. Silently no-ops on non-macOS.
+- `Session(sandboxed=True)` parameter propagates to Kernel.
+- `FORGE_DISABLE_SANDBOX=1` escape hatch.
+- **Two-layer defense in depth**: in-process `forge.tools` denylist + OS-level `sandbox-exec`. A bypass via `os.open` or `ctypes` still hits the OS layer.
+- Tests: 24 new (`test_sandbox.py`) — including a real `sandbox-exec` boundary test that actually fires on macOS.
+
+### Test summary
+
+| | v0.1.0 | After Wave 1 | After Wave 2+3 |
+|---|---:|---:|---:|
+| Tests | 144 | 167 | **286** |
+| Source LOC | 3,704 | 4,718 | **~7,500** |
+| Modules | 11 | 12 | **17** *(+providers, mcp, installer, sandbox, repl)* |
+
+### Deps
+
+- `+anthropic>=0.40` (Wave 2a)
+- `+prompt_toolkit>=3.0` (Wave 1)
+- `+tomli-w>=1.0` (already there from v0.1)
+
+---
+
 ## [Unreleased] — Wave 1: vision + streaming + multi-line REPL
 
 ### Added
