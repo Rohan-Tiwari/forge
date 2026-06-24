@@ -3,6 +3,69 @@
 All notable changes to Forge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] — 2026-06-24 — Waves 1-4
+
+Major release. 5 waves of features, **331 tests passing**, ~9,000 LOC of
+source. Honest scope: feature-complete on the architecture from the original
+plan; production deployment of untrusted skills still gated on Wave-5 work
+(see SAFETY.md).
+
+### Highlights
+
+- **Vision** — `see(image)` reads images via local Qwen2.5-VL
+- **Streaming** — token-by-token rendering in chat
+- **Multi-line REPL** — prompt_toolkit with history + slash completion
+- **Multi-provider** — Anthropic + OpenAI as auto-detected escalation chain
+- **Dry-run preview** — cells execute against an overlay, real diffs surface
+- **macOS sandbox** — `sandbox-exec` profile bounds the kernel
+- **MCP** — `call_mcp(server, tool, **args)` talks to stdio MCP servers
+- **Skill installer** — git-pinned + AST-scanned skill install
+- **Skill discovery** — `forge skill search` queries GitHub
+- **Plan mode** — `forge plan TASK` returns markdown plan, no execution
+- **forge stats** — per-window activity rollup
+- **Pricing override** — `~/.forge/pricing.toml`
+- **Daemon mode** — file watchers + cron schedules
+
+### Wave 4 (this release): polish + power features
+
+- **W4a — Daemon mode** (commit `fcc4150`): `forge daemon` with file watchers
+  + cron schedules + double-fork backgrounding. Custom 5-field cron parser.
+  Per-watcher debouncing. 29 new tests.
+- **W4b — Pricing.toml override** (commit `762772a`): users customize
+  per-model rates without editing source. Override merged over baseline.
+- **W4c — Plan mode** (commit `762772a`): markdown plan with goal / steps /
+  risk levels / files / network / open questions. No execution.
+- **W4d — Skill discovery** (commit `762772a`): `forge skill search` queries
+  GitHub `topic:forge-skill`. `forge skill update` re-installs at upstream
+  HEAD.
+- **W4e — forge stats** (commit `762772a`): per-window summary with sessions,
+  calls, tokens, cost, latency p50/p95, gate decisions, top models.
+- **W4g — Polish** (this commit): version bump to 0.2.0, comprehensive README
+  rewrite, 3 working `examples/` recipes (triage-inbox, daily-standup,
+  codebase-tour), CHANGELOG.
+
+### Tests
+
+**331 passing** (+302 from v0.1.0). New test suites:
+- `test_vision.py` (15) — see() against mocked + real Qwen
+- `test_streaming.py` (9) — streaming + REPL session construction
+- `test_router_providers.py` (24) — provider routing, escalation, pricing
+- `test_mcp.py` (20) — MCP client against in-process fake server
+- `test_installer.py` (39) — skill install end-to-end from real local git
+- `test_dry_run.py` (12) — overlay execution safety invariant
+- `test_sandbox.py` (24) — sandbox-exec profile + real boundary firing
+- `test_pricing_and_plan.py` (16) — pricing override + plan mode
+- `test_daemon.py` (29) — cron parser + watcher debouncer + PID helpers
+
+### Deps added in v0.2
+
+- `anthropic>=0.40` — Anthropic SDK for the escalation chain
+- `prompt_toolkit>=3.0` — multi-line REPL
+- `watchdog>=4.0` — daemon mode file watchers
+- (already there from v0.1) `tomli-w>=1.0`
+
+---
+
 ## [Unreleased] — Waves 2 + 3: real escalation, MCP, skill installer, dry-run, sandbox
 
 ### Wave 2a — Multi-provider router with real escalation (commit 666fd35)

@@ -1,0 +1,10 @@
+[watchers.pdf-triage]
+path = "~/Downloads"
+pattern = "*.pdf"
+event = "created"
+task = """
+Read the PDF at {path}. Extract the title, 3 key points, and any action items.
+Write the result to a sibling .summary.md file (same path, .pdf replaced with .summary.md).
+Use pdftotext via Bash for text-based PDFs, or see() with the vision model for image-based ones.
+"""
+cooldown_s = 10

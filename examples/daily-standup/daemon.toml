@@ -1,0 +1,10 @@
+[schedules.daily-standup]
+cron = "0 9 * * 1-5"
+task = """
+Generate today's standup. In this order:
+1. Summarize git commits I authored in the last 24h (group by repo)
+2. List open PRs assigned to or authored by me (use call_mcp('gh', ...) if the gh MCP server is configured)
+3. Identify anything blocking — PR conversations awaiting my response
+Write the result to ./standup-{date}.md
+"""
+workspace = "~/work"
