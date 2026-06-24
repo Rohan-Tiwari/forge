@@ -446,7 +446,7 @@ class Session:
 
         The plan prompt asks the model to write:
           1. Goal
-          2. Steps (each with rationale + risk level: low/medium/high)
+          2. Steps (each with rationale + risk level: low/medium/high/critical)
           3. Files it would touch
           4. Network calls it would make
           5. Open questions
@@ -454,25 +454,36 @@ class Session:
         No code executes. No shadow git commits. No kernel involvement.
         Returns the markdown plan as a string.
 
-        Use case: review-before-action for high-stakes tasks.
+        Use case: review-before-action for high-stakes tasks. The whole point
+        is letting the user see what the agent WOULD do for risky intents —
+        the planner is instructed to ALWAYS produce a structured plan, even
+        for destructive tasks, with critical-risk markers and refusal
+        rationale folded into the Open questions section.
         """
         plan_system = (
             "You are Forge in PLAN MODE. The user wants to see a plan, not "
-            "have you do the work. Respond with a markdown plan only — no "
-            "code fences, no intent blocks. Sections:\n\n"
+            "have you do the work. ALWAYS respond with the structured "
+            "markdown plan below — even for tasks you would refuse to "
+            "execute. A flat refusal defeats the purpose of plan mode; "
+            "instead, write a plan with Risk: critical markers and put your "
+            "objections under Open questions.\n\n"
+            "Response format (no code fences, no intent blocks):\n\n"
             "## Goal\n"
             "(restate the user's task in one sentence)\n\n"
             "## Steps\n"
             "Numbered list. For each step:\n"
             "- What you'd do\n"
             "- Why\n"
-            "- Risk: low / medium / high\n\n"
+            "- Risk: low / medium / high / critical\n\n"
             "## Files touched\n"
             "(or 'none')\n\n"
             "## Network calls\n"
             "(or 'none')\n\n"
             "## Open questions\n"
-            "(things you'd need to verify before running)\n\n"
+            "Things you'd need to verify, OR your reasons for declining to "
+            "execute this plan (still include the plan itself above so the "
+            "user can review). Use this section to surface ethical / safety "
+            "concerns rather than refusing the whole response.\n\n"
             "Keep it under 600 words. Be specific."
         )
         messages = [
@@ -493,7 +504,44 @@ class Session:
             out_tokens=completion.completion_tokens,
             cost_usd=completion.cost_usd,
         )
-        return completion.content.strip()
+
+        # If the model still flat-refused despite the prompt (sometimes happens
+        # at high effort for very-aligned tasks), wrap the refusal in our
+        # structured format so the contract holds.
+        text = completion.content.strip()
+        if not text:
+            return "(planner returned empty response)"
+        # Detect a likely refusal: no markdown header in the first 200 chars
+        # and contains a refusal phrase. If so, synthesize a critical-risk
+        # decline plan.
+        first = text[:200].lower()
+        looks_refused = (
+            "## " not in first
+            and any(p in first for p in (
+                "i'm sorry", "i can't", "i won't", "cannot help",
+                "can't help", "i am unable",
+            ))
+        )
+        if looks_refused:
+            return (
+                "## Goal\n"
+                f"{user_msg.strip()}\n\n"
+                "## Steps\n"
+                "1. (no plan produced — planner declined)\n"
+                "   - Why: the planner refused to enumerate steps for this task.\n"
+                "   - Risk: **critical**\n\n"
+                "## Files touched\n"
+                "unknown (planner declined to enumerate)\n\n"
+                "## Network calls\n"
+                "unknown (planner declined to enumerate)\n\n"
+                "## Open questions\n"
+                f"The planner returned a refusal: {text!r}\n\n"
+                "If you genuinely want to proceed, you'll need to break the "
+                "task down yourself and run individual cells. Plan mode "
+                "cannot expand a refusal into actionable steps without your "
+                "involvement."
+            )
+        return text
 
     # ---- preview / confirm hooks ----------------------------------------
 

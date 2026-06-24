@@ -231,6 +231,17 @@ def run(
                           f"(must be 'always', 'cells', or 'never')")
         raise typer.Exit(2)
 
+    # When stdin isn't a TTY (piped invocations, CI, daemon triggers), the
+    # interactive approval prompt has nowhere to read from. Auto-fall-back
+    # to preview=never with a one-line note rather than silently denying.
+    if not auto and preview != "never" and not sys.stdin.isatty():
+        err_console.print(
+            "[yellow]note:[/] stdin is not a TTY — using --preview never. "
+            "Pass --auto to skip this message, or --preview cells from a "
+            "real terminal for the interactive confirmation flow."
+        )
+        preview = "never"
+
     try:
         with _run_session(
             workspace=workspace, auto=auto, preview=preview,
@@ -543,6 +554,7 @@ def stats(
     days: int = typer.Option(
         7, "--days", "-d",
         help="Window of days to summarize (default 7).",
+        min=1,
     ),
 ) -> None:
     """Per-session and per-day rollup of agent activity.
@@ -552,9 +564,11 @@ def stats(
       - Token totals (input/output)
       - Top models by call count
       - Gate decisions: confirm / deny ratios
-      - Latency P50/P95
+      - Latency P50/P95 (only shown when N >= 10 — small-sample percentiles
+        are misleading)
       - Kernel health: wedged events
     """
+    import math as _math
     import time as _time
     from collections import Counter
     from datetime import datetime, timezone
@@ -620,7 +634,7 @@ def stats(
         elif kind == "permission.grant_session":
             gate_actions["allow_session"] += 1
 
-    console.print(f"[bold]forge stats[/] · last {days} days · "
+    console.print(f"[bold]forge stats[/] · last {days} day{'s' if days != 1 else ''} · "
                   f"{len(sessions)} session{'s' if len(sessions) != 1 else ''}")
 
     agg = Table(show_header=False, box=None, padding=(0, 2))
@@ -632,11 +646,23 @@ def stats(
     agg.add_row("[dim]total cost[/]", f"${total_cost:.4f}")
     if elapsed_samples:
         elapsed_samples.sort()
-        p50 = elapsed_samples[len(elapsed_samples) // 2]
-        p95_idx = max(0, int(len(elapsed_samples) * 0.95) - 1)
-        p95 = elapsed_samples[p95_idx]
-        agg.add_row("[dim]latency p50[/]", f"{p50:.2f}s")
-        agg.add_row("[dim]latency p95[/]", f"{p95:.2f}s")
+        n = len(elapsed_samples)
+        # Nearest-rank percentile. Avoids the int(N*0.95)-1 bias that
+        # collapses p95 onto p50 for small N.
+        def _pct(p: float) -> float:
+            idx = max(0, min(n - 1, _math.ceil(p * n) - 1))
+            return elapsed_samples[idx]
+
+        if n >= 10:
+            agg.add_row("[dim]latency p50[/]", f"{_pct(0.50):.2f}s")
+            agg.add_row("[dim]latency p95[/]", f"{_pct(0.95):.2f}s")
+        else:
+            # Too few samples for meaningful percentiles — show min/max/avg.
+            avg = sum(elapsed_samples) / n
+            agg.add_row("[dim]latency[/]",
+                        f"min {elapsed_samples[0]:.2f}s / "
+                        f"avg {avg:.2f}s / max {elapsed_samples[-1]:.2f}s "
+                        f"[dim](N={n})[/]")
     if kernel_wedged_events:
         agg.add_row("[dim]kernel wedged[/]", f"[red]{kernel_wedged_events}[/]")
     console.print(agg)
@@ -668,7 +694,14 @@ def stats(
                              key=lambda x: x[1].get("started", ""),
                              reverse=True)[:10]
         for sid, s in sorted_sids:
-            started = s.get("started", "")[-12:]
+            # Parse ISO timestamp into "MM-DD HH:MM" — readable across days.
+            started_raw = s.get("started", "")
+            try:
+                clean = started_raw.rstrip("Z").split(".")[0]
+                dt = datetime.fromisoformat(clean)
+                started = dt.strftime("%m-%d %H:%M")
+            except (ValueError, TypeError):
+                started = started_raw[-12:]
             failed_str = (f"[red]{s['cells_failed']}[/]"
                           if s["cells_failed"] else "0")
             s_table.add_row(

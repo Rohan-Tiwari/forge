@@ -1,0 +1,453 @@
+{
+  "probes": [
+    {
+      "name": "W4b pricing.toml override stress test",
+      "outcome": "success",
+      "summary": "All 5 probes against /Users/I758976/Documents/LLMs/gpt-oss-20b/forge/src/forge/providers.py passed. (1) Baseline price('claude-sonnet-4-6', 1e6, 0) returns 3.0 under a clean tmp HOME with empty _PRICING_OVERRIDE. (2) Writing ~/.forge/pricing.toml with input=1.5/output=7.5 under tmp HOME plus reload_pricing() makes price() return 1.5 \u2014 override wins. (3) Corrupt TOML is caught by the tomllib.TOMLDecodeError except clause in _load_pricing_override(); reload_pricing() does not raise, override resets to {}, and price falls back to baseline 3.0. (4) Brand-new model ids not in _PRICING_BASELINE ('my-custom-model', 'enterprise-claude') are added via override and price correctly (3.0 and 0.0). (5) _PRICING merge is correct: overridden claude-sonnet-4-6 shows (2.0, 9.0) in merged dict while _PRICING_BASELINE retains (3.0, 15.0); new model 'brand-new' coexists with all 8 baseline ids (merged size 9 = 8 baseline + 1 new override). Design note: price() consults _PRICING_OVERRIDE then _PRICING_BASELINE directly \u2014 _PRICING is only for inspection \u2014 which keeps lookup semantics unambiguous.",
+      "findings": [
+        {
+          "severity": "low",
+          "category": "design",
+          "title": "_PRICING merged dict is exposed but never consulted by price()",
+          "detail": "price() in providers.py:179-183 reads _PRICING_OVERRIDE and _PRICING_BASELINE independently rather than the merged _PRICING dict. _PRICING is only mutated by reload_pricing() for inspection. This is correct and defensible (it makes precedence explicit and avoids a third place that could go stale), but the redundancy is worth a brief comment so future refactors don't unify them and accidentally lose the precedence ordering.",
+          "suggested_fix": "Either add a one-line comment above the _PRICING assignment clarifying 'inspection-only, price() does not read this' or have price() consult _PRICING and drop the duplicate lookup logic. Current code is correct; pick one source of truth."
+        },
+        {
+          "severity": "low",
+          "category": "reliability",
+          "title": "_load_pricing_override silently swallows malformed per-model entries",
+          "detail": "Lines 148-156 skip TOML entries whose value is not a dict or whose input/output cannot be cast to float. There is no logging \u2014 a user with a typo (e.g. `input = \"3.0\"` quoted as a string works via float(), but `input = [3.0]` is silently dropped). For an override file users edit by hand, a one-line stderr warning would aid debugging without breaking the graceful-fallback contract.",
+          "suggested_fix": "On the except branches at lines 145-146 and 155-156, log via logging.getLogger(__name__).warning(...) with the path and offending key. Keeps the function infallible while making misconfigurations diagnosable."
+        },
+        {
+          "severity": "low",
+          "category": "correctness",
+          "title": "Override caches at import time; long-running daemons miss edits",
+          "detail": "_PRICING_OVERRIDE is populated at module import (line 162) and the docstring on line 161 notes 'if the user edits the file they reload the process'. reload_pricing() exists but is not wired to any signal/file-watcher. The daemon (src/forge/daemon.py) and REPL therefore serve stale prices until restart. Probe 2 only worked because the test explicitly called reload_pricing().",
+          "suggested_fix": "Either (a) check the file's mtime inside price() and reload on change (cheap, one stat call per call \u2014 fine), or (b) document the restart requirement in the user-facing docs and add a `forge reload-pricing` CLI verb. Current behavior matches the docstring's stated contract, so this is informational."
+        }
+      ]
+    },
+    {
+      "name": "W4c plan-mode stress test",
+      "outcome": "partial",
+      "summary": "Ran 5 probes against `forge plan` (gpt-oss:20b planner) in clean cwd /tmp/forge_w4c_test. Probes 1, 2, 5 PASS. Probe 4 PARTIAL (no user files touched, no shadow commits from plan, but .forge/ workspace bootstrap occurs on first invocation despite docstring promising \"no files change\"). Probe 3 FAIL \u2014 dangerous task triggers model refusal rather than a structured high-risk plan, defeating the point of review-mode. Audit log at /tmp/forge_w4c_test/.forge/audit.jsonl shows correct plan.start/plan.complete event pairs for all three planning runs. Probe-1 plan output contains the required 5 sections: Goal, Steps, Files touched, Network calls, Open questions, with per-step Risk annotations.",
+      "findings": [
+        {
+          "severity": "high",
+          "category": "correctness",
+          "title": "Probe 3: dangerous task returns refusal instead of risk-annotated plan",
+          "detail": "`forge plan \"delete /etc\"` produced a one-line model refusal (\"I\u2019m sorry, but I can\u2019t help with that.\") instead of a structured plan with high-risk markers. Plan mode is review-only \u2014 its purpose per the docstring is to let the user inspect risky intents before executing. Refusal defeats this: the user gets no insight into what the agent would attempt or why it's risky, and cannot make an informed decision. The planner role should always emit the 5-section format with Risk: high/critical markers on each dangerous step, never a flat refusal.",
+          "reproducer": "/Library/Frameworks/Python.framework/Versions/3.13/bin/forge plan \"delete /etc\" --cwd /tmp/forge_w4c_test",
+          "suggested_fix": "Adjust the planner system prompt to require structured-plan output even for destructive tasks, with explicit Risk: critical markers and a prominent warning block. Alternatively, post-process refusals into a synthetic high-risk-decline plan so the contract holds. Consider adding integration tests covering at least one destructive prompt to lock the format."
+        },
+        {
+          "severity": "low",
+          "category": "docs",
+          "title": "Probe 4: `.forge/` workspace dir is auto-created by plan despite \"no files change\" promise",
+          "detail": "`forge plan --help` states \"no cells execute, no files change.\" In a fresh cwd, plan bootstraps the workspace: creates `.forge/`, `.forge/audit.jsonl`, and an initialized shadow git repo (.forge/shadow/ with a `shadow:init` commit). User content is untouched and the shadow repo gets zero plan-generated commits \u2014 but technically the filesystem is modified on first invocation. This may surprise users running plan as a pre-flight check on a directory they expect to leave pristine.",
+          "reproducer": "rm -rf /tmp/probe4 && mkdir /tmp/probe4 && /Library/Frameworks/Python.framework/Versions/3.13/bin/forge plan \"hello\" --cwd /tmp/probe4 && find /tmp/probe4 -type f",
+          "suggested_fix": "Either (a) defer workspace creation until a `run` is actually invoked and write the plan audit entry to a tmp/global log instead, or (b) tighten the help text to read \"no cells execute, no user files change \u2014 a `.forge/` workspace is created on first use for the audit log and shadow git repo.\""
+        },
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "Probe 1 plan goes beyond requested scope (suggests creating files)",
+          "detail": "For the trivial read-only task \"count python files\" the plan's Files touched section says \"Create a new file count_py_files.py (or similar).\" A one-liner `find . -name '*.py' | wc -l` would suffice; the planner over-engineers into building a CLI wrapper with argparse, tests, etc. This is a model-tuning concern, not a hard bug, but it inflates apparent risk and token usage for read-only intents.",
+          "suggested_fix": "Add a planner-prompt hint to prefer minimal one-shot shell solutions for read-only queries and only propose new files when persistence is explicitly requested."
+        }
+      ]
+    },
+    {
+      "name": "W4e forge stats stress-test",
+      "outcome": "success",
+      "summary": "All four probes for `forge stats` passed end-to-end against a real install (`/Library/Frameworks/Python.framework/Versions/3.13/bin/forge`) backed by Ollama gpt-oss:20b. Probe 1 (empty workspace): clean output with zero totals and an explicit \"no activity in the last 7 days. Try `forge run \\\"hello\\\"` to seed some data.\" hint. Probe 2 (two `forge run --auto` tasks): 2 sessions / 4 model calls / 2 cells run / 5,203 in tokens / 244 out tokens, with a models table and recent-sessions table. Probe 3 (`--days` filter): verified with a hand-crafted audit log containing a 10-day-old session and a fresh session \u2014 `--days 7` correctly excluded the old session (1 session, 3 calls), `--days 14` included both (2 sessions, 5 calls); short `-d` alias works; `--days 0` correctly returns \"no activity\". Probe 4 (latency p50/p95): with N=100 latencies 1.0s..100.0s, reported p50=51.00s and p95=95.00s \u2014 both sensible and matching the implementation indices in cli.py:635-637. Two minor rough edges found (medium and low severity) \u2014 not blockers, but worth tightening for v0.2.",
+      "findings": [
+        {
+          "severity": "medium",
+          "category": "correctness",
+          "title": "p95 latency collapses onto p50 (and is biased low) at small sample counts",
+          "detail": "src/forge/cli.py:635-637 computes percentiles by integer indexing on a sorted list:\n    p50 = elapsed_samples[len(elapsed_samples) // 2]\n    p95_idx = max(0, int(len(elapsed_samples) * 0.95) - 1)\n    p95 = elapsed_samples[p95_idx]\nFor the empirically common case of N=4 (observed in the live probe: sorted samples [0.85, 2.27, 12.56, 13.10]), p50_idx = 4//2 = 2 and p95_idx = max(0, int(4*0.95)-1) = max(0, 2) = 2 \u2014 so p50 and p95 both read sample[2] = 12.56s. The displayed table shows `latency p50 12.56s` / `latency p95 12.56s`, which is misleading: it hides the true tail (13.10s) and looks like a duplicated row. Same issue at N=3 ([1.0, 5.0, 20.0] \u2192 p50=5.0 \u2713, p95 indexed at max(0, int(2.85)-1)=1 \u2192 5.0, when the obviously-intended tail is 20.0). At N>=20 the formula behaves reasonably (verified: N=100 with 1..100s gives p50=51.00s, p95=95.00s).",
+          "reproducer": "mkdir /tmp/fs && cd /tmp/fs && forge run --auto 'create hello.txt' -C . && forge run --auto 'print 2+2' -C . && forge stats -C . | grep latency",
+          "suggested_fix": "Either (a) gate the percentile rows on a minimum sample count (e.g. show only when len(elapsed_samples) >= ~10, otherwise display `min / max` or just `avg`); or (b) use a standard nearest-rank formula like `samples[min(len(samples)-1, math.ceil(0.95*len(samples))-1)]` and drop the unnecessary `int(...) - 1` bias. A two-line fix using statistics.quantiles or numpy.percentile would also work, but the simpler guard is probably the right call for a CLI that wants to avoid surprising users with `p50 == p95`."
+        },
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "`--days 0` and negative values produce technically-correct but odd output",
+          "detail": "`forge stats --days 0` reports `last 0 days \u00b7 0 sessions` and the seed hint `Try \\`forge run \"hello\"\\` to seed some data.` even when the workspace has plenty of activity (because cutoff_ts = now - 0). `--days -1` happily prints `last -1 days` (cutoff in the future, so no records match). Neither crashes, but both look like bugs to a user. Also the pluralization is off: `last 1 days` (Probe 3 shows this).",
+          "suggested_fix": "Validate `days >= 1` in the typer option (raise typer.BadParameter for <= 0). Fix pluralization: `f\"last {days} day{'s' if days != 1 else ''}\"`."
+        },
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "Started-time column shows only fractional seconds, not a readable timestamp",
+          "detail": "In the `recent sessions` table the `started` column slices `started[-12:]` of the raw ISO timestamp, producing entries like `5:02:35.008Z` and `5:02:15.663Z` (Probe 2 output). The leading H is dropped (single-digit hour 5 instead of 05), date is gone entirely, and milliseconds dominate. This is fine for back-to-back runs in a single shell session but useless for the stated use case of `Per-session and per-day rollup` across multiple days.",
+          "suggested_fix": "Parse `started` once and format with `dt.strftime('%m-%d %H:%M')` (or full ISO if width allows). At minimum strip the millisecond fraction and zero-pad the hour."
+        },
+        {
+          "severity": "low",
+          "category": "design",
+          "title": "Header pluralization edge case: `last 1 days`",
+          "detail": "src/forge/cli.py:623-624 pluralizes the session count but not the days count, so `forge stats --days 1` prints `forge stats \u00b7 last 1 days \u00b7 2 sessions`. The session-count pluralization right next to it makes this stand out more.",
+          "suggested_fix": "Apply the same `'s' if X != 1 else ''` pattern to days, or just use a helper."
+        }
+      ]
+    },
+    {
+      "name": "forge skill search/update probe",
+      "outcome": "success",
+      "summary": "All four probes passed. `forge skill search \"\"` returns a friendly \"no skills found\" message with a GITHUB_TOKEN rate-limit hint. `forge skill update <nonexistent>` errors cleanly with \"skill '<name>' not installed\" and exit code 1 \u2014 no traceback. `latest_sha(\"nonexistent-owner-12345\", \"nonexistent-repo\")` returns None as designed (urllib 404 is caught and converted to None per the docstring contract). `forge skill --help` lists all 7 subcommands: list, show, permit, install, diff, search, update.",
+      "findings": [
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "search empty-query hint conflates 'no matches' with 'rate-limited'",
+          "detail": "`forge skill search \"\"` prints: 'no skills found. Either nothing matches, or GitHub rate-limited us \u2014 try `export GITHUB_TOKEN=...` and retry.' The two cases are distinguishable from the HTTP response (403 with rate-limit headers vs. 200 with empty `items`). Surfacing the actual cause would save the user from setting a token unnecessarily.",
+          "suggested_fix": "In the search code path, inspect the response status / `X-RateLimit-Remaining` header and only suggest GITHUB_TOKEN when actually rate-limited; otherwise just say 'no skills match'.",
+          "reproducer": "forge skill search \"\""
+        }
+      ]
+    },
+    {
+      "name": "W4a-daemon-probes",
+      "outcome": "success",
+      "summary": "All 5 W4a daemon probes pass at /Users/I758976/Documents/LLMs/gpt-oss-20b/forge. `forge daemon --status` reports \"daemon not running\"; `forge daemon --stop` exits 1 with \"no daemon to stop\"; `forge daemon` without ~/.forge/daemon.toml prints \"no triggers configured. add watchers/schedules to ~/.forge/daemon.toml\" and exits 1; cron_matches(\"0 9 * * 1-5\", Tue 09:00) returns True; --help lists --status, --stop, and --background (-b).",
+      "findings": [
+        {
+          "severity": "low",
+          "category": "correctness",
+          "title": "Probe 1: --status when none running",
+          "detail": "`forge daemon --status` returns exit 0 with message 'daemon not running'. Clean message confirmed.",
+          "reproducer": "cd /Users/I758976/Documents/LLMs/gpt-oss-20b/forge && forge daemon --status"
+        },
+        {
+          "severity": "low",
+          "category": "correctness",
+          "title": "Probe 2: --stop when none running",
+          "detail": "`forge daemon --stop` exits 1 with stderr 'no daemon to stop'. Clean error confirmed.",
+          "reproducer": "cd /Users/I758976/Documents/LLMs/gpt-oss-20b/forge && forge daemon --stop"
+        },
+        {
+          "severity": "low",
+          "category": "correctness",
+          "title": "Probe 3: daemon without toml config",
+          "detail": "With no ~/.forge/daemon.toml present, `forge daemon` prints warning 'no triggers configured.\\nadd watchers/schedules to ~/.forge/daemon.toml' and exits 1. Warning + exit confirmed.",
+          "reproducer": "rm -f ~/.forge/daemon.toml; forge daemon"
+        },
+        {
+          "severity": "low",
+          "category": "correctness",
+          "title": "Probe 4: cron_matches Tue 9am",
+          "detail": "cron_matches('0 9 * * 1-5', struct_time for 2026-06-23 09:00 (Tuesday, tm_wday=1)) returns True. Implementation in src/forge/daemon.py:155.",
+          "reproducer": "python3 -c \"import sys,time; sys.path.insert(0,'src'); from forge.daemon import cron_matches; print(cron_matches('0 9 * * 1-5', time.strptime('2026-06-23 09:00:00','%Y-%m-%d %H:%M:%S')))\""
+        },
+        {
+          "severity": "low",
+          "category": "docs",
+          "title": "Probe 5: --help advertises required flags",
+          "detail": "`forge daemon --help` lists --background/-b (Fork to background, logs to ~/.forge/daemon.log), --stop (Stop a backgrounded daemon), --status (Show daemon status), plus --config/-c and --help. All three target flags present.",
+          "reproducer": "forge daemon --help"
+        }
+      ]
+    }
+  ],
+  "task_results": [
+    {
+      "name": "plan-then-run",
+      "outcome": "success",
+      "summary": "forge plan produced a detailed 5-step plan (verify dir, recursive walk, filter pyc/__pycache__/hidden, count, report) with 3 open questions but no files touched and no network calls. forge run (after --auto was required because the first attempt blocked on an interactive approval prompt) executed a single cell using pathlib rglob(\"*.py\") and reported 19, which matches the ground truth `find ... -name \"*.py\" -type f | wc -l` = 19. Audit log shows plan.start/plan.complete for the plan session and turn.start/cell.exec(ok=True)/turn.end.prose for the run session. Plan was over-engineered relative to what executed: the run did not apply the planned filters for .pyc/__pycache__/hidden dirs and did not resolve the open questions before executing.",
+      "findings": [
+        {
+          "severity": "low",
+          "category": "correctness",
+          "title": "Final count (19) matches ground truth",
+          "detail": "forge run reported 19 Python files; `find /Users/I758976/Documents/LLMs/gpt-oss-20b/forge/src -name '*.py' -type f | wc -l` also returns 19. rglob('*.py') happens to be safe here because no __pycache__/.pyc or stray hidden-dir .py files exist under that tree."
+        },
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "Plan and run both completed within timeout",
+          "detail": "Plan completed in ~29s (5:04:57 -> 5:05:26); run cell.exec completed at 5:07:35 after start at 5:06:34 (~61s). Both well under the 180s timeout."
+        },
+        {
+          "severity": "medium",
+          "category": "ux",
+          "title": "Default `forge run` blocks on interactive approval, breaking non-interactive use",
+          "detail": "First `forge run \"count python files ...\"` invocation (no flags) prompted 'allow? es / o / lways for this session (n):' and, with no stdin attached, was recorded as gate.user_deny in the audit log (session 42-33207). The agent then exited with 'ran 0 cells, denied 1' and a meta-reply asking to proceed. A non-interactive caller must pass `--auto` (or `--preview never`) for the task to actually execute. Worth surfacing this in docs/help or auto-detecting non-TTY stdin.",
+          "reproducer": "/Library/Frameworks/Python.framework/Versions/3.13/bin/forge run \"count python files in /Users/I758976/Documents/LLMs/gpt-oss-20b/forge/src\"  # hangs/denies without TTY; rerun with --auto succeeds",
+          "suggested_fix": "When stdin is not a TTY, either auto-deny with a clear error pointing at --auto, or default --preview to 'never' for piped invocations."
+        },
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "Dry-run skipped due to workspace size flag",
+          "detail": "Preview banner reported 'flagged: workspace too large (6106 MB) - dry-run skipped'. The cwd was /Users/I758976/Documents/Joule_Dev, unrelated to the target path being counted. Users may want to pass `-C` to a smaller workspace, or forge could base the size check on directories the cell actually touches."
+        },
+        {
+          "severity": "low",
+          "category": "design",
+          "title": "Plan vs run divergence: planner suggested filters the executor ignored",
+          "detail": "Plan step 3 called for excluding *.pyc, __pycache__, and hidden dirs, and listed three open questions (hidden dirs, .pyc, depth/size limits). The executed cell was a one-liner `list(root.rglob('*.py'))` with no filtering and no clarification of the open questions. For this specific tree the answer still happens to be correct, but on a tree containing __pycache__ or hidden dirs the plan and the run would disagree.",
+          "suggested_fix": "Either have the driver address (or explicitly discard) planner open questions before executing, or have the planner mark steps as 'informational' vs 'required' so the run-side knows which filters are load-bearing."
+        },
+        {
+          "severity": "low",
+          "category": "docs",
+          "title": "Audit log captures the full plan/deny/auto-run lifecycle",
+          "detail": "`forge log` clearly shows plan.start/plan.complete for session 92-32896, gate.user_deny for the first run attempt (42-33207), and cell.exec ok=True stdout_chars=82 for the --auto run (94-33471). Good observability; no fix needed."
+        }
+      ]
+    },
+    {
+      "name": "streaming-multicell",
+      "outcome": "success",
+      "summary": "Forge ran the task in auto mode using driver gpt-oss:20b. It executed 1 cell (intent: \"Create data.json with specified content, read it back and print its keys\"), wrote /tmp/forge-dogfood/data.json with the requested keys {hello:world, forge:v2}, and produced a final reply confirming completion. 0 denials, 0 escalations, cost $0.0000, ~35s total. Audit log at /tmp/forge-dogfood/.forge/audit.jsonl contains session.start, turn.start, model.complete, cell.exec (ok=true, pre/post sha recorded), model.complete, turn.end.prose, and session.end events. Shadow git repo present under .forge/shadow.",
+      "findings": [
+        {
+          "severity": "low",
+          "category": "correctness",
+          "title": "data.json created with correct keys and values",
+          "detail": "File /tmp/forge-dogfood/data.json contains valid JSON {\"hello\": \"world\", \"forge\": \"v2\"} matching the requested content."
+        },
+        {
+          "severity": "low",
+          "category": "reliability",
+          "title": "Audit log captured full lifecycle",
+          "detail": "audit.jsonl recorded session.start, turn.start, two model.complete events, cell.exec with pre_sha/post_sha and writes=[./data.json], turn.end.prose, and session.end. Shadow git repo initialized under .forge/shadow for state tracking."
+        },
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "Single-cell execution despite multi-step intent",
+          "detail": "Although the prompt asked for create + read + print keys, forge collapsed this into a single cell.exec (writes=[./data.json], stdout_chars=38). This is reasonable for a trivial task but means the 'read back and print keys' step was not visible as a distinct streamed cell. Final prose reply asserts keys were printed; the printed output (likely keys) lives only in the cell's stdout (38 chars), not surfaced in the reply panel."
+        },
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "Reply does not show the printed keys",
+          "detail": "Final reply states 'its keys were printed as requested' but does not include the actual key list in the rendered reply panel. Users running --auto would have to inspect cell stdout to verify."
+        }
+      ]
+    },
+    {
+      "name": "sandbox-active",
+      "outcome": "success",
+      "summary": "Forge ran the auto task successfully under sandbox in /tmp/forge-sandbox-test. Driver gpt-oss:20b executed 1 cell, ok=true, 0 denials, 0 escalations, no network, no file writes. Audit log records pre/post shadow-git SHAs, model token counts, and session lifecycle events cleanly. A second confirmation run in /tmp/forge-sandbox-test2 with explicit print of repr(FORGE_RESULT_FD) and platform.system() produced stdout_chars=11, consistent with \"None\\nDarwin\\n\" \u2014 confirming FORGE_RESULT_FD is not exposed inside the sandboxed cell while platform.system() returns \"Darwin\". Console reply was suppressed (TUI shows only summary panel), but audit log fully captures execution.",
+      "findings": [
+        {
+          "severity": "low",
+          "category": "reliability",
+          "title": "Sandboxed cell execution works cleanly",
+          "detail": "forge run --auto executed the requested print cell with ok=true, stdout_chars=9 (first run) / 11 (second run), stderr_chars=0, no network access, no file writes. Shadow git committed pre and post SHAs (301c637 -> df79c9b). Session start/turn.start/model.complete/cell.exec/turn.end.prose/session.end all present in /tmp/forge-sandbox-test/.forge/audit.jsonl. Exit code 0. Total cost $0.0000 (local gpt-oss:20b)."
+        },
+        {
+          "severity": "low",
+          "category": "docs",
+          "title": "FORGE_RESULT_FD not exposed inside sandboxed cell",
+          "detail": "Confirmation run in /tmp/forge-sandbox-test2 with explicit repr() printing produced stdout_chars=11, matching 'None\\nDarwin\\n'. This means os.environ.get('FORGE_RESULT_FD') returns None inside the sandboxed cell \u2014 the environment variable is stripped by the sandbox layer before the cell process starts. platform.system() returns 'Darwin' as expected on macOS host.",
+          "reproducer": "mkdir /tmp/forge-sandbox-test && cd /tmp/forge-sandbox-test && /Library/Frameworks/Python.framework/Versions/3.13/bin/forge run --auto \"Print os.environ.get('FORGE_RESULT_FD') and platform.system()\""
+        },
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "Cell stdout not surfaced in TUI summary",
+          "detail": "The forge TUI prints only the model's prose reply ('The requested environment variable and OS platform have been printed.') and a 'ran 1 cells' summary line \u2014 the actual cell stdout is not shown to the user, only its char count is recorded in audit.jsonl. For verify/debug workflows users may have to consult the audit log or ask the driver to echo the values in its reply. Not a bug, but worth noting for dogfooding (relevant to in-progress task #76 W4f rough-edge fixes).",
+          "suggested_fix": "Consider a --show-stdout flag or surfacing the last cell stdout under the reply panel when stdout_chars > 0 in auto mode."
+        }
+      ]
+    },
+    {
+      "name": "stats-after-runs",
+      "outcome": "success",
+      "summary": "forge stats --days 1 ran successfully. Output reports 0 sessions, 0 model calls, 0 cells, 0 tokens, and $0.0000 cost for the last 1 day window, plus a hint to seed data via `forge run \"hello\"`. The audit log at /Users/I758976/Documents/LLMs/gpt-oss-20b/forge/.forge/audit.jsonl contains 44 entries but the most recent is dated 2026-06-15 (session.end), outside the 1-day window relative to today, so the zero counts are consistent with the audit log contents.",
+      "findings": [
+        {
+          "severity": "low",
+          "category": "correctness",
+          "title": "Stats command reports zero activity correctly",
+          "detail": "forge stats --days 1 returns a well-formatted summary table (model calls, cells run, input/output tokens, total cost) plus a friendly hint when there is no recent activity. The zero counts match the audit log, whose latest entry (session.end 2026-06-15T23:01:26Z) is outside the 1-day window."
+        },
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "Helpful empty-state hint",
+          "detail": "When there is no activity in the requested window, the CLI suggests `forge run \"hello\"` to seed data, which is a nice UX touch for idle or first-time users."
+        }
+      ]
+    },
+    {
+      "name": "auto-mode-protected",
+      "outcome": "success",
+      "summary": "Forge auto mode correctly refused to create a backup of ~/.zshrc outside its workspace. The driver attempted two cell executions targeting `~/.zshrc.bak`; both were blocked by Forge's workspace sandbox (audit shows ok:false with stderr output for both). The agent then produced a polite refusal reply explaining it cannot access protected paths and suggested the user run `cp` themselves. No backup file was created at ~/.zshrc.bak, and ~/.zshrc remains untouched. Session ran 2 cells, 0 escalations, $0.00 cost, total ~40s.",
+      "findings": [
+        {
+          "severity": "low",
+          "category": "security",
+          "title": "Workspace sandbox blocks writes to ~/ as expected",
+          "detail": "Auto mode invoked `forge run --auto` from workspace /private/tmp/forge-protected-test. The driver issued two cell.exec attempts with writes=[\"~/.zshrc.bak\"]; both returned ok:false with non-empty stderr (533 and 621 chars respectively), indicating the sandbox rejected paths outside the workspace. Verified post-run: `ls ~/.zshrc.bak` returns 'No such file or directory', and ~/.zshrc mtime (May 22 2026) is unchanged."
+        },
+        {
+          "severity": "low",
+          "category": "ux",
+          "title": "Refusal reply is clear and actionable",
+          "detail": "Final prose response explains the restriction and offers a manual workaround (`cp ~/.zshrc ~/.zshrc.bak`) for the user to run themselves. Tone is polite and the suggestion is correct."
+        },
+        {
+          "severity": "low",
+          "category": "reliability",
+          "title": "Audit log captures denied attempts cleanly",
+          "detail": "/tmp/forge-protected-test/.forge/audit.jsonl records session.start, turn.start, two cell.exec entries with ok:false plus pre_sha/post_sha, model.complete entries, turn.end.prose, and session.end. The shadow git repo recorded both rejected attempts as commits, but no files leaked into the workspace itself (only .forge/ metadata present)."
+        }
+      ]
+    }
+  ],
+  "synthesis": {
+    "summary": "Wave-4 dogfood validated forge's core surfaces: pricing override semantics, sandbox enforcement, audit logging, stats, skill management, and daemon control-plane all behaved correctly under stress. Two issues rise above the noise: plan-mode refuses destructive intents instead of emitting risk-annotated structured plans (defeating the purpose of review mode), and the percentile math in `forge stats` collapses p95 onto p50 at the small sample counts users will actually see. The rest is a coherent batch of low-severity UX polish \u2014 non-TTY interactive prompts, pluralization, timestamp formatting, undocumented `.forge/` bootstrap on plan, silent override-file errors, and the gap between the planner's stated filters and what the executor actually does. No correctness, security, or data-loss defects found.",
+    "top_findings": [
+      {
+        "rank": 1,
+        "severity": "high",
+        "category": "correctness",
+        "title": "Plan mode returns a flat model refusal for destructive tasks instead of a risk-annotated structured plan",
+        "where": "planner system prompt / `forge plan` pipeline (W4c Probe 3)",
+        "evidence": "`forge plan \"delete /etc\" --cwd /tmp/forge_w4c_test` produced \"I'm sorry, but I can't help with that.\" with none of the required Goal/Steps/Files/Network/Open-questions sections. Review mode's entire value proposition is letting the user see what the agent *would* do on dangerous intents; a refusal hides this.",
+        "suggested_fix": "Tighten the planner prompt to always emit the 5-section format with explicit `Risk: critical` markers on dangerous steps, or post-process refusals into a synthetic high-risk-decline plan. Add an integration test covering at least one destructive prompt to lock the contract.",
+        "fix_estimate_hours": 3
+      },
+      {
+        "rank": 2,
+        "severity": "medium",
+        "category": "correctness",
+        "title": "`forge stats` p95 collapses onto p50 (and is biased low) at small sample counts",
+        "where": "src/forge/cli.py:635-637",
+        "evidence": "`p95_idx = max(0, int(len(elapsed_samples) * 0.95) - 1)` \u2014 at N=4 with sorted [0.85,2.27,12.56,13.10], both p50_idx and p95_idx land on index 2 \u2192 table shows `p50 12.56s / p95 12.56s`, hiding the true tail 13.10s. Same collapse at N=3. Behaves correctly only for N >= ~20.",
+        "suggested_fix": "Either gate the percentile rows on N >= 10 (show min/max/avg otherwise), or switch to nearest-rank `samples[min(len-1, math.ceil(0.95*N)-1)]` and drop the `int(...) - 1` bias. `statistics.quantiles` would also work.",
+        "fix_estimate_hours": 1
+      },
+      {
+        "rank": 3,
+        "severity": "medium",
+        "category": "ux",
+        "title": "Default `forge run` blocks on interactive approval with no TTY, silently denying piped/automated callers",
+        "where": "`forge run` approval gate",
+        "evidence": "First `forge run \"count python files ...\"` without --auto prompted `allow? es / o / lways for this session (n):`; with no stdin attached this was recorded as `gate.user_deny` (session 42-33207) and exited with `ran 0 cells, denied 1`. Caller must know to pass `--auto` or `--preview never`.",
+        "suggested_fix": "Detect non-TTY stdin in the gate: either auto-deny with a clear error pointing at `--auto`, or default `--preview` to `never` for piped invocations. Mention the flag in `forge run --help`.",
+        "fix_estimate_hours": 2
+      },
+      {
+        "rank": 4,
+        "severity": "low",
+        "category": "docs",
+        "title": "`forge plan` creates `.forge/` workspace and shadow git repo despite \"no files change\" promise",
+        "where": "`forge plan` workspace bootstrap (W4c Probe 4)",
+        "evidence": "`forge plan --help` claims \"no cells execute, no files change.\" In a fresh cwd, plan creates `.forge/`, `.forge/audit.jsonl`, and a `shadow:init` commit in `.forge/shadow/`. User content is untouched, but the filesystem is modified \u2014 surprising for a pre-flight inspection.",
+        "suggested_fix": "Either defer workspace creation until first `run` (write plan audit to a tmp/global log), or tighten help text: \"no cells execute, no user files change \u2014 a `.forge/` workspace is created on first use for the audit log and shadow git repo.\"",
+        "fix_estimate_hours": 1
+      },
+      {
+        "rank": 5,
+        "severity": "low",
+        "category": "ux",
+        "title": "Planner over-engineers read-only intents and doesn't resolve its own open questions before execution",
+        "where": "planner prompt + plan/run hand-off (plan-then-run agent task, W4c Probe 1)",
+        "evidence": "For \"count python files\" the planner proposed creating a new `count_py_files.py` with argparse/tests and left 3 open questions (hidden dirs, .pyc, depth limits). The executed cell was a one-liner `list(root.rglob('*.py'))` with none of the planned filters applied \u2014 the plan and the run disagree on a tree containing `__pycache__`.",
+        "suggested_fix": "Add planner hint to prefer minimal one-shot shell solutions for read-only queries. Mark plan steps as `informational` vs `required` so the run-side knows which filters are load-bearing, or have the driver explicitly resolve/discard open questions before executing.",
+        "fix_estimate_hours": 3
+      },
+      {
+        "rank": 6,
+        "severity": "low",
+        "category": "ux",
+        "title": "Cell stdout invisible in TUI/auto-mode reply panel; users must consult audit log",
+        "where": "TUI summary rendering (streaming-multicell + sandbox-active agent tasks)",
+        "evidence": "Multiple runs: final reply asserts \"keys were printed\" / \"environment variable and OS platform have been printed\" but the actual stdout values do not appear \u2014 only `stdout_chars` is in audit.jsonl. Forces users to grep the audit log to verify output.",
+        "suggested_fix": "Add a `--show-stdout` flag or surface the last cell's stdout under the reply panel automatically when `stdout_chars > 0` in auto mode.",
+        "fix_estimate_hours": 2
+      },
+      {
+        "rank": 7,
+        "severity": "low",
+        "category": "ux",
+        "title": "`forge stats --days` accepts 0 and negative values; pluralization wrong for `last 1 days`",
+        "where": "src/forge/cli.py (typer option for --days) and header formatter ~lines 623-624",
+        "evidence": "`forge stats --days 0` prints `last 0 days \u00b7 0 sessions` plus the seed hint even on populated workspaces; `--days -1` cheerfully reports `last -1 days`. Pluralization is also off: `last 1 days \u00b7 2 sessions`.",
+        "suggested_fix": "Validate `days >= 1` via `typer.BadParameter` and pluralize with `f\"last {days} day{'s' if days != 1 else ''}\"`.",
+        "fix_estimate_hours": 0.5
+      },
+      {
+        "rank": 8,
+        "severity": "low",
+        "category": "ux",
+        "title": "`forge stats` recent-sessions `started` column is unreadable (`5:02:35.008Z`)",
+        "where": "src/forge/cli.py recent-sessions table",
+        "evidence": "Column slices `started[-12:]` of the ISO timestamp, producing entries like `5:02:35.008Z` \u2014 single-digit hour, no date, milliseconds dominate. Useless for the stated multi-day rollup use case.",
+        "suggested_fix": "Parse and reformat with `dt.strftime('%m-%d %H:%M')` (or full ISO if width allows); at minimum strip milliseconds and zero-pad the hour.",
+        "fix_estimate_hours": 0.5
+      },
+      {
+        "rank": 9,
+        "severity": "low",
+        "category": "ux",
+        "title": "`forge skill search` empty-result hint conflates 'no matches' with 'rate-limited'",
+        "where": "skill search code path",
+        "evidence": "`forge skill search \"\"` prints \"no skills found. Either nothing matches, or GitHub rate-limited us \u2014 try `export GITHUB_TOKEN=...`\". The two cases are distinguishable via HTTP status / `X-RateLimit-Remaining`; surfacing the real cause saves users from setting unnecessary tokens.",
+        "suggested_fix": "Inspect response status / rate-limit headers; only suggest GITHUB_TOKEN when actually rate-limited.",
+        "fix_estimate_hours": 1
+      },
+      {
+        "rank": 10,
+        "severity": "low",
+        "category": "reliability",
+        "title": "`_load_pricing_override` silently swallows malformed per-model entries",
+        "where": "src/forge/providers.py lines 145-156",
+        "evidence": "Per-entry except branches skip TOML rows whose value isn't a dict or whose input/output can't be cast to float, with no logging. A typo like `input = [3.0]` is silently dropped \u2014 bad UX for a file users edit by hand.",
+        "suggested_fix": "Log via `logging.getLogger(__name__).warning(...)` on each except branch with the path and offending key. Keeps the function infallible while making misconfigurations diagnosable.",
+        "fix_estimate_hours": 0.5
+      },
+      {
+        "rank": 11,
+        "severity": "low",
+        "category": "correctness",
+        "title": "Pricing override caches at import; long-running daemons/REPL serve stale prices until restart",
+        "where": "src/forge/providers.py line 162 (import-time `_PRICING_OVERRIDE` load) + reload_pricing()",
+        "evidence": "`reload_pricing()` exists but isn't wired to any file-watcher or signal handler; daemon.py and the REPL won't pick up `~/.forge/pricing.toml` edits. Probe 2 only worked because the test called `reload_pricing()` explicitly. Docstring on line 161 acknowledges restart requirement.",
+        "suggested_fix": "Either stat the file inside `price()` and reload on mtime change (one stat per call is fine), or add a `forge reload-pricing` CLI verb and document the restart requirement more prominently.",
+        "fix_estimate_hours": 1.5
+      },
+      {
+        "rank": 12,
+        "severity": "low",
+        "category": "design",
+        "title": "`_PRICING` merged dict is exposed but never read by `price()` \u2014 duplicate source of truth",
+        "where": "src/forge/providers.py:179-183",
+        "evidence": "`price()` consults `_PRICING_OVERRIDE` and `_PRICING_BASELINE` directly; `_PRICING` is only mutated by `reload_pricing()` for inspection. Correct today, but a future refactor could unify them and silently lose precedence ordering.",
+        "suggested_fix": "Add a one-line comment above the `_PRICING` assignment: `# inspection-only \u2014 price() does not read this`. Or drop `_PRICING` entirely.",
+        "fix_estimate_hours": 0.25
+      }
+    ],
+    "unexpected_positives": [
+      "Workspace sandbox correctly blocks writes to ~/.zshrc.bak from auto mode and emits a polite, actionable refusal (auto-mode-protected) \u2014 security boundary holds.",
+      "FORGE_RESULT_FD is stripped from the sandboxed cell environment (sandbox-active probe confirmed `None` returned inside the cell) \u2014 no host secrets leak into the cell process.",
+      "Pricing override TOML corruption is caught by tomllib.TOMLDecodeError without crashing; override resets to {} and price() falls back to baseline (W4b Probe 3).",
+      "Audit log captures the full plan/deny/auto-run lifecycle including gate.user_deny, pre/post shadow-git SHAs, and turn.end.prose \u2014 observability is strong.",
+      "Daemon control-plane (--status, --stop, --background, missing config) all behave cleanly with no tracebacks and correct exit codes (W4a Probes 1-3, 5).",
+      "`forge skill update <nonexistent>` errors with a clean message and exit 1 \u2014 no traceback when target isn't installed.",
+      "`forge stats` empty-state output includes a helpful seed hint (`forge run \"hello\"`) instead of just zero counts."
+    ],
+    "fix_order_v0_2_1": [
+      "1. Plan mode must emit structured risk-annotated plans for destructive intents (no flat refusals) \u2014 add regression test (rank 1, ~3h)",
+      "2. Fix `forge stats` p50/p95 collapse at small N \u2014 guard or use nearest-rank (rank 2, ~1h)",
+      "3. Non-TTY `forge run` should not silently deny \u2014 auto-fall-back to clear error pointing at --auto, or default preview=never when piped (rank 3, ~2h)",
+      "4. Fix `--days` validation and pluralization in `forge stats` (rank 7, ~0.5h)",
+      "5. Reformat `forge stats` `started` column to readable `MM-DD HH:MM` (rank 8, ~0.5h)",
+      "6. Disambiguate `forge skill search` empty vs rate-limited via response headers (rank 9, ~1h)",
+      "7. Add logging to `_load_pricing_override` skip branches (rank 10, ~0.5h)",
+      "8. Add stdout-surfacing affordance to TUI auto-mode reply panel (--show-stdout or auto when chars>0) (rank 6, ~2h)",
+      "9. Tighten `forge plan --help` text re: `.forge/` workspace bootstrap, or defer creation (rank 4, ~1h)",
+      "10. Planner prompt: prefer minimal solutions for read-only intents; mark steps required vs informational (rank 5, ~3h)",
+      "11. Wire pricing override mtime check into price() for daemon hot-reload (rank 11, ~1.5h)",
+      "12. Add inspection-only comment to `_PRICING` merged dict (rank 12, ~0.25h)"
+    ]
+  }
+}
