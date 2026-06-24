@@ -435,6 +435,66 @@ class Session:
         )
         return result
 
+    # ---- plan mode -----------------------------------------------------
+
+    def plan(self, user_msg: str) -> str:
+        """Plan-only mode: model writes a markdown plan, no cells execute.
+
+        Uses the `planner` role (defaults to gpt-oss at high effort, but
+        auto-escalates to claude-sonnet if ANTHROPIC_API_KEY is set — see
+        forge.router.default_roles).
+
+        The plan prompt asks the model to write:
+          1. Goal
+          2. Steps (each with rationale + risk level: low/medium/high)
+          3. Files it would touch
+          4. Network calls it would make
+          5. Open questions
+
+        No code executes. No shadow git commits. No kernel involvement.
+        Returns the markdown plan as a string.
+
+        Use case: review-before-action for high-stakes tasks.
+        """
+        plan_system = (
+            "You are Forge in PLAN MODE. The user wants to see a plan, not "
+            "have you do the work. Respond with a markdown plan only — no "
+            "code fences, no intent blocks. Sections:\n\n"
+            "## Goal\n"
+            "(restate the user's task in one sentence)\n\n"
+            "## Steps\n"
+            "Numbered list. For each step:\n"
+            "- What you'd do\n"
+            "- Why\n"
+            "- Risk: low / medium / high\n\n"
+            "## Files touched\n"
+            "(or 'none')\n\n"
+            "## Network calls\n"
+            "(or 'none')\n\n"
+            "## Open questions\n"
+            "(things you'd need to verify before running)\n\n"
+            "Keep it under 600 words. Be specific."
+        )
+        messages = [
+            {"role": "system", "content": plan_system},
+            {"role": "user", "content": user_msg},
+        ]
+        self.log.write("plan.start", user_msg_chars=len(user_msg))
+        try:
+            completion = self.router.complete(messages, role="planner")
+        except Exception as e:  # noqa: BLE001
+            self.log.write("plan.error", error=str(e))
+            return f"(plan-mode call failed: {e})"
+
+        self.log.write(
+            "plan.complete",
+            model=completion.model_used,
+            in_tokens=completion.prompt_tokens,
+            out_tokens=completion.completion_tokens,
+            cost_usd=completion.cost_usd,
+        )
+        return completion.content.strip()
+
     # ---- preview / confirm hooks ----------------------------------------
 
     def _call_driver(self, on_chunk: Optional[ChunkCallback]) -> Completion:

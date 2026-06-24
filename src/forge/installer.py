@@ -505,3 +505,113 @@ def diff_installed(name: str) -> str:
         f"  to upgrade: forge skill install {latest.source.replace('github.com/','')}"
         f"@<new-sha>"
     )
+
+
+# =============================================================================
+# Search — query GitHub for repos tagged forge-skill
+# =============================================================================
+
+
+def search_skills(query: str, *, limit: int = 10) -> list[dict[str, str]]:
+    """Search GitHub for repos with the `forge-skill` topic.
+
+    Returns a list of {name, owner, full_name, description, stars, url, updated}
+    dicts. Skips silently on network errors — search is a convenience, never
+    a blocker.
+
+    No GitHub auth required for this endpoint (60 req/hr unauthenticated).
+    Users behind corporate proxies who hit rate limits can set GITHUB_TOKEN
+    to upgrade to 5000/hr.
+    """
+    import json
+    import os
+    import urllib.parse
+    import urllib.request
+    import urllib.error
+
+    q = (query.strip() + " topic:forge-skill" if query.strip()
+         else "topic:forge-skill")
+    url = (
+        "https://api.github.com/search/repositories?"
+        f"q={urllib.parse.quote_plus(q)}&sort=stars&order=desc&per_page={limit}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "forge-skill-search",
+        },
+    )
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+        return []
+
+    results: list[dict[str, str]] = []
+    for item in (data.get("items") or [])[:limit]:
+        results.append({
+            "full_name": str(item.get("full_name", "")),
+            "owner": str(item.get("owner", {}).get("login", "")),
+            "name": str(item.get("name", "")),
+            "description": (str(item.get("description") or "")[:160]),
+            "stars": str(item.get("stargazers_count", 0)),
+            "url": str(item.get("html_url", "")),
+            "updated": str(item.get("updated_at", ""))[:10],
+            "default_branch": str(item.get("default_branch") or "main"),
+        })
+    return results
+
+
+def latest_sha(owner: str, repo: str, ref: str = "HEAD") -> Optional[str]:
+    """Look up the latest sha for a ref. Used by `forge skill update` to
+    discover whether an upgrade exists without needing a local clone.
+
+    Returns None on any failure — caller uses that as 'don't know,
+    user must specify sha'.
+    """
+    import json
+    import os
+    import urllib.error
+    import urllib.request
+
+    if ref == "HEAD":
+        # Use the default branch endpoint
+        url = f"https://api.github.com/repos/{owner}/{repo}/branches/HEAD"
+        # ↑ HEAD isn't a branch; we'd need to look up default_branch first.
+        # Easier: get the repo metadata.
+        meta_url = f"https://api.github.com/repos/{owner}/{repo}"
+        try:
+            req = urllib.request.Request(
+                meta_url,
+                headers={"Accept": "application/vnd.github+json",
+                         "User-Agent": "forge-skill-update"},
+            )
+            token = os.environ.get("GITHUB_TOKEN")
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                meta = json.load(resp)
+            ref = meta.get("default_branch", "main")
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+            return None
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "forge-skill-update"},
+        )
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+        return data.get("sha")
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+        return None

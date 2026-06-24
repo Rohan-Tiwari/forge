@@ -90,11 +90,18 @@ class Provider(Protocol):
 
 # =============================================================================
 # Pricing — per-model cost in $/1M tokens.
+#
+# Three layers, in priority order:
+#   1. ~/.forge/pricing.toml (user override; most specific wins)
+#   2. The hardcoded baseline below
+#   3. (0, 0) for unknown models (never crashes)
+#
+# The baseline reflects mid-2026 public pricing. Users who get enterprise
+# discounts, self-host, or use a proxy can override per-model rates without
+# editing source.
 # =============================================================================
-# Local models are $0. Frontier prices reflect public 2026-mid pricing; users
-# can override via ~/.forge/pricing.toml (TODO v0.3).
 
-_PRICING: dict[str, tuple[float, float]] = {
+_PRICING_BASELINE: dict[str, tuple[float, float]] = {
     # Local
     "gpt-oss:20b": (0.0, 0.0),
     "qwen2.5vl:7b": (0.0, 0.0),
@@ -109,10 +116,79 @@ _PRICING: dict[str, tuple[float, float]] = {
 }
 
 
+def _load_pricing_override() -> dict[str, tuple[float, float]]:
+    """Read ~/.forge/pricing.toml. Returns {} if absent or unparseable.
+
+    Format:
+        [pricing.<model-id>]
+        input = 3.0     # $ per 1M input tokens
+        output = 15.0   # $ per 1M output tokens
+
+    Example:
+        [pricing."claude-sonnet-4-6"]
+        input = 1.5
+        output = 7.5
+
+        [pricing."my-custom-model"]
+        input = 0.0
+        output = 0.0
+    """
+    import tomllib
+    from pathlib import Path
+
+    path = Path.home() / ".forge" / "pricing.toml"
+    if not path.exists():
+        return {}
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    for model, entry in (data.get("pricing") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            inp = float(entry.get("input", 0))
+            outp = float(entry.get("output", 0))
+            out[str(model)] = (inp, outp)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+# Cached at module load. Override doesn't change at runtime; if the user
+# edits the file they reload the process — that's the expected workflow.
+_PRICING_OVERRIDE: dict[str, tuple[float, float]] = _load_pricing_override()
+
+
+# Combined view: override wins over baseline. Public for inspection / tests.
+_PRICING: dict[str, tuple[float, float]] = {
+    **_PRICING_BASELINE,
+    **_PRICING_OVERRIDE,
+}
+
+
 def price(model: str, p_in: int, p_out: int) -> float:
-    """Return cost in USD for the given token counts."""
-    in_cost, out_cost = _PRICING.get(model, (0.0, 0.0))
+    """Return cost in USD for the given token counts.
+
+    Override layer is consulted first — useful for users on custom pricing
+    (enterprise discounts, self-hosted models with electricity costs, etc).
+    Falls back to the baseline. Unknown models return 0 rather than crash.
+    """
+    if model in _PRICING_OVERRIDE:
+        in_cost, out_cost = _PRICING_OVERRIDE[model]
+    else:
+        in_cost, out_cost = _PRICING_BASELINE.get(model, (0.0, 0.0))
     return (p_in / 1_000_000) * in_cost + (p_out / 1_000_000) * out_cost
+
+
+def reload_pricing() -> dict[str, tuple[float, float]]:
+    """Re-read ~/.forge/pricing.toml. Useful for tests + interactive REPL."""
+    global _PRICING_OVERRIDE, _PRICING
+    _PRICING_OVERRIDE = _load_pricing_override()
+    _PRICING = {**_PRICING_BASELINE, **_PRICING_OVERRIDE}
+    return dict(_PRICING)
 
 
 # =============================================================================

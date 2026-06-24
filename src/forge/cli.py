@@ -165,6 +165,50 @@ def _format_user_error(e: Exception) -> str:
 
 
 @app.command()
+def plan(
+    task: str = typer.Argument(..., help="The task to plan (no execution)."),
+    workspace: Path = typer.Option(Path("."), "--cwd", "-C"),
+    debug: bool = typer.Option(False, "--debug"),
+) -> None:
+    """Get a markdown plan for a task — no cells execute, no files change.
+
+    Uses the `planner` role (defaults to gpt-oss at high effort; auto-escalates
+    to Claude or GPT if their API key is set). Returns a structured plan with
+    goal, steps with risk levels, files touched, network calls, open questions.
+
+    Use this before running risky tasks to review what the agent intends to do.
+    """
+    try:
+        with _run_session(
+            workspace=workspace, auto=True, preview="never",
+            dry_run=False,
+        ) as s:
+            console.print(f"[dim]planning · {s.session_id} · "
+                          f"planner: {s.router.roles['planner'].primary}[/]")
+            console.print()
+            try:
+                markdown = s.plan(task)
+            except KeyboardInterrupt:
+                console.print("[yellow](interrupted)[/]")
+                return
+            from rich.markdown import Markdown
+            console.print(Panel(
+                Markdown(markdown),
+                title="plan",
+                border_style="blue",
+            ))
+            console.print(
+                f"\n[dim]review the plan, then run:[/]\n"
+                f"  [bold]forge run \"{task[:60]}{'...' if len(task) > 60 else ''}\"[/]"
+            )
+    except Exception as e:  # noqa: BLE001
+        if debug:
+            raise
+        err_console.print(_format_user_error(e))
+        raise typer.Exit(1)
+
+
+@app.command()
 def run(
     task: str = typer.Argument(..., help="The task for the agent."),
     workspace: Path = typer.Option(
@@ -494,6 +538,153 @@ def cost(
 
 
 @app.command()
+def stats(
+    workspace: Path = typer.Option(Path("."), "--cwd", "-C"),
+    days: int = typer.Option(
+        7, "--days", "-d",
+        help="Window of days to summarize (default 7).",
+    ),
+) -> None:
+    """Per-session and per-day rollup of agent activity.
+
+    Reads the audit log and prints aggregate metrics:
+      - Sessions in the window with cells run, escalations, cost
+      - Token totals (input/output)
+      - Top models by call count
+      - Gate decisions: confirm / deny ratios
+      - Latency P50/P95
+      - Kernel health: wedged events
+    """
+    import time as _time
+    from collections import Counter
+    from datetime import datetime, timezone
+
+    audit = AuditLog(audit_log_path(workspace.resolve()))
+    cutoff_ts = _time.time() - (days * 86400)
+
+    sessions: dict[str, dict] = {}
+    by_model: Counter[str] = Counter()
+    gate_actions: Counter[str] = Counter()
+    total_in_tokens = 0
+    total_out_tokens = 0
+    total_cost = 0.0
+    total_calls = 0
+    cell_runs = 0
+    cell_failures = 0
+    kernel_wedged_events = 0
+    elapsed_samples: list[float] = []
+
+    for rec in audit.find():
+        t_str = rec.get("t", "")
+        try:
+            t_clean = t_str.rstrip("Z").split(".")[0]
+            ts = datetime.fromisoformat(t_clean).replace(tzinfo=timezone.utc).timestamp()
+        except (ValueError, TypeError):
+            continue
+        if ts < cutoff_ts:
+            continue
+
+        sid = rec.get("session", "")
+        kind = rec.get("kind", "")
+        if sid and sid not in sessions:
+            sessions[sid] = {
+                "started": t_str, "cells": 0, "cells_failed": 0,
+                "escalations": 0, "cost": 0.0, "calls": 0,
+            }
+
+        if kind == "model.complete":
+            total_calls += 1
+            total_in_tokens += int(rec.get("in_tokens") or 0)
+            total_out_tokens += int(rec.get("out_tokens") or 0)
+            cost_v = float(rec.get("cost_usd") or 0)
+            total_cost += cost_v
+            by_model[rec.get("model", "?")] += 1
+            elapsed_samples.append(float(rec.get("elapsed_s") or 0))
+            if sid in sessions:
+                sessions[sid]["cost"] += cost_v
+                sessions[sid]["calls"] += 1
+        elif kind == "cell.exec":
+            cell_runs += 1
+            if not rec.get("ok"):
+                cell_failures += 1
+            if sid in sessions:
+                sessions[sid]["cells"] += 1
+                if not rec.get("ok"):
+                    sessions[sid]["cells_failed"] += 1
+        elif kind == "kernel.wedged":
+            kernel_wedged_events += 1
+        elif kind == "gate.confirm":
+            gate_actions["confirm"] += 1
+        elif kind in {"gate.user_deny", "turn.end.user_denied"}:
+            gate_actions["deny"] += 1
+        elif kind == "permission.grant_session":
+            gate_actions["allow_session"] += 1
+
+    console.print(f"[bold]forge stats[/] · last {days} days · "
+                  f"{len(sessions)} session{'s' if len(sessions) != 1 else ''}")
+
+    agg = Table(show_header=False, box=None, padding=(0, 2))
+    agg.add_row("[dim]model calls[/]", f"{total_calls:,}")
+    agg.add_row("[dim]cells run[/]",
+                f"{cell_runs:,}  ({cell_failures:,} failed)")
+    agg.add_row("[dim]input tokens[/]", f"{total_in_tokens:,}")
+    agg.add_row("[dim]output tokens[/]", f"{total_out_tokens:,}")
+    agg.add_row("[dim]total cost[/]", f"${total_cost:.4f}")
+    if elapsed_samples:
+        elapsed_samples.sort()
+        p50 = elapsed_samples[len(elapsed_samples) // 2]
+        p95_idx = max(0, int(len(elapsed_samples) * 0.95) - 1)
+        p95 = elapsed_samples[p95_idx]
+        agg.add_row("[dim]latency p50[/]", f"{p50:.2f}s")
+        agg.add_row("[dim]latency p95[/]", f"{p95:.2f}s")
+    if kernel_wedged_events:
+        agg.add_row("[dim]kernel wedged[/]", f"[red]{kernel_wedged_events}[/]")
+    console.print(agg)
+
+    if by_model:
+        console.print("\n[bold]models[/]")
+        m_table = Table(show_header=True, header_style="bold")
+        m_table.add_column("model")
+        m_table.add_column("calls", justify="right")
+        for m, n in by_model.most_common(8):
+            m_table.add_row(m, f"{n:,}")
+        console.print(m_table)
+
+    if gate_actions:
+        console.print("\n[bold]gate decisions[/]")
+        for action, n in gate_actions.most_common():
+            console.print(f"  {action:18s} {n}")
+
+    if sessions:
+        console.print("\n[bold]recent sessions[/]")
+        s_table = Table(show_header=True, header_style="bold")
+        s_table.add_column("session")
+        s_table.add_column("started", style="dim")
+        s_table.add_column("calls", justify="right")
+        s_table.add_column("cells", justify="right")
+        s_table.add_column("failed", justify="right")
+        s_table.add_column("cost", justify="right")
+        sorted_sids = sorted(sessions.items(),
+                             key=lambda x: x[1].get("started", ""),
+                             reverse=True)[:10]
+        for sid, s in sorted_sids:
+            started = s.get("started", "")[-12:]
+            failed_str = (f"[red]{s['cells_failed']}[/]"
+                          if s["cells_failed"] else "0")
+            s_table.add_row(
+                sid[-8:], started, str(s["calls"]),
+                str(s["cells"]), failed_str, f"${s['cost']:.4f}",
+            )
+        console.print(s_table)
+
+    if total_calls == 0:
+        console.print(
+            f"\n[dim]no activity in the last {days} days. "
+            f"Try `forge run \"hello\"` to seed some data.[/]"
+        )
+
+
+@app.command()
 def doctor(
     workspace: Path = typer.Option(Path("."), "--cwd", "-C"),
 ) -> None:
@@ -738,6 +929,117 @@ def skill_diff(name: str = typer.Argument(..., help="Skill name (from `forge ski
     """Show what would change if you reinstalled this skill at upstream HEAD."""
     from forge.installer import diff_installed
     console.print(diff_installed(name))
+
+
+@skill_app.command("search")
+def skill_search(
+    query: str = typer.Argument(
+        "", help="Search terms. Empty = list all skills tagged forge-skill."
+    ),
+    limit: int = typer.Option(10, "-n", "--limit"),
+) -> None:
+    """Search GitHub for repos tagged with the `forge-skill` topic.
+
+    No auth needed for unauthenticated 60 req/hr. Set GITHUB_TOKEN for higher
+    rate limits. Sorted by stars.
+    """
+    from forge.installer import search_skills
+
+    console.print(f"[dim]searching github for skills{f' matching {query!r}' if query else ''}…[/]")
+    results = search_skills(query, limit=limit)
+    if not results:
+        console.print(
+            "[yellow]no skills found.[/]\n"
+            "[dim]Either nothing matches, or GitHub rate-limited us — "
+            "try `export GITHUB_TOKEN=...` and retry.[/]"
+        )
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("repo")
+    table.add_column("★", justify="right")
+    table.add_column("updated", style="dim")
+    table.add_column("description")
+    for r in results:
+        desc = r["description"] or "[dim](no description)[/]"
+        if len(desc) > 70:
+            desc = desc[:67] + "..."
+        table.add_row(r["full_name"], r["stars"], r["updated"], desc)
+    console.print(table)
+    console.print(
+        f"\n[dim]install one with:[/]\n"
+        f"  forge skill install <repo>@<sha>"
+    )
+
+
+@skill_app.command("update")
+def skill_update(
+    name: str = typer.Argument(..., help="Skill name (from `forge skill list`)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+) -> None:
+    """Check for upstream changes and re-install at the latest sha.
+
+    Looks up the default branch's HEAD on GitHub, compares to the
+    installed sha, and re-invokes `skill install` if they differ.
+    """
+    from forge.installer import latest_sha, load_manifest
+
+    entries = [e for e in load_manifest() if e.name == name]
+    if not entries:
+        err_console.print(f"[red]skill {name!r} not installed[/]")
+        raise typer.Exit(1)
+    latest = entries[-1]
+
+    # Parse source like 'github.com/alice/forge-skills'
+    src = latest.source
+    if not src.startswith("github.com/"):
+        err_console.print(
+            f"[yellow]skill update only supports GitHub-sourced skills.[/]\n"
+            f"[dim]installed source: {src}[/]"
+        )
+        raise typer.Exit(1)
+    owner_repo = src[len("github.com/"):]
+    try:
+        owner, repo = owner_repo.split("/", 1)
+    except ValueError:
+        err_console.print(f"[red]can't parse owner/repo from {src!r}[/]")
+        raise typer.Exit(1)
+
+    console.print(f"[dim]checking {owner}/{repo} for updates…[/]")
+    upstream = latest_sha(owner, repo)
+    if upstream is None:
+        err_console.print(
+            "[yellow]could not reach GitHub. Network error or rate-limited.[/]"
+        )
+        raise typer.Exit(1)
+
+    if upstream == latest.sha:
+        console.print(f"[green]up to date[/] · {latest.sha[:12]}")
+        return
+
+    console.print(
+        f"[yellow]update available:[/] {latest.sha[:12]} → {upstream[:12]}"
+    )
+    if not yes:
+        if not typer.confirm("install the new version?", default=True):
+            console.print("[dim]aborted[/]")
+            return
+
+    # Recurse into `skill install` for the actual work — same flow.
+    console.print()
+    from forge.installer import (
+        SkillSpec, execute_install, prepare_install,
+    )
+    spec = SkillSpec(
+        url=f"https://github.com/{owner}/{repo}.git",
+        ref=upstream,
+        source=src,
+        name=name,
+    )
+    plan = prepare_install(spec)
+    entry = execute_install(plan)
+    console.print(
+        f"[green]updated[/] {entry.name}@{entry.sha[:12]} → {entry.install_path}"
+    )
 
 
 if __name__ == "__main__":
