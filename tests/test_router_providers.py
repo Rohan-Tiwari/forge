@@ -382,3 +382,160 @@ def test_router_stream_chunks_from_chosen_provider():
     # The accumulated contents grow across chunks
     deltas = [c.delta for c in chunks if c.delta]
     assert "".join(deltas) == "streaming hello"
+
+
+# =============================================================================
+# OllamaProvider — wire-protocol regression tests
+# =============================================================================
+
+
+def _ollama_for_test(api_base: str = "http://localhost:11434") -> OllamaProvider:
+    """Construct an OllamaProvider without hitting the network."""
+    p = OllamaProvider.__new__(OllamaProvider)
+    p.base_url = api_base + "/v1"
+    p.api_base = api_base
+    p.client = None  # legacy path not exercised
+    p._use_v1 = False
+    return p
+
+
+def test_extract_raw_from_tool_call_error_recovers_python_source():
+    p = _ollama_for_test()
+    error_body = (
+        "{\"error\":{\"message\":\"error parsing tool call: "
+        "raw='from pathlib import Path\\np = Path(\\\"/x\\\")\\n', "
+        "err=invalid character 'r' in literal false (expecting 'a')\","
+        "\"type\":\"api_error\"}}"
+    )
+    recovered = p._extract_raw_from_tool_call_error(error_body)
+    assert recovered is not None
+    assert "from pathlib import Path" in recovered
+    assert 'Path("/x")' in recovered
+    assert recovered.endswith("\n")
+
+
+def test_extract_raw_returns_none_for_unrelated_error():
+    p = _ollama_for_test()
+    assert p._extract_raw_from_tool_call_error("connection refused") is None
+    assert p._extract_raw_from_tool_call_error(
+        '{"error":{"message":"model not found"}}'
+    ) is None
+
+
+def test_complete_native_recovers_from_tool_call_parse_500(monkeypatch):
+    """The whole point of v0.2.2: an HTTP 500 from Ollama's harmony parser
+    becomes a Completion with the recovered raw output, not a hard failure.
+    """
+    import io
+    import urllib.error
+
+    p = _ollama_for_test()
+
+    error_body = (
+        b'{"error":{"message":"error parsing tool call: '
+        b"raw='print(1+1)\\n', err=invalid character "
+        b'\'p\' in literal null","type":"api_error"}}'
+    )
+
+    def _fake_urlopen(req, timeout=600):
+        raise urllib.error.HTTPError(
+            url=req.full_url, code=500, msg="parse",
+            hdrs=None, fp=io.BytesIO(error_body),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    comp = p.complete(
+        model="gpt-oss:20b",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=100, temperature=0.0,
+        effort="medium", num_ctx=8192, role="driver",
+    )
+    assert "print(1+1)" in comp.content
+    assert comp.finish_reason == "tool_call_parse_recovered"
+    assert comp.cost_usd == 0.0
+
+
+def test_complete_native_non_parse_error_still_raises(monkeypatch):
+    """Genuine errors (model not found, OOM, etc.) must still surface."""
+    import io
+    import urllib.error
+
+    p = _ollama_for_test()
+
+    def _fake_urlopen(req, timeout=600):
+        raise urllib.error.HTTPError(
+            url=req.full_url, code=404, msg="not found",
+            hdrs=None, fp=io.BytesIO(b'{"error":"model not found"}'),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    with pytest.raises(RuntimeError, match="ollama HTTP 404"):
+        p.complete(
+            model="missing:99b",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=10, temperature=0.0,
+            effort="low", num_ctx=4096, role="driver",
+        )
+
+
+def test_complete_native_unreachable_gives_friendly_error(monkeypatch):
+    import urllib.error
+
+    p = _ollama_for_test()
+
+    def _fake_urlopen(req, timeout=600):
+        raise urllib.error.URLError("Connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    with pytest.raises(RuntimeError, match="ollama unreachable"):
+        p.complete(
+            model="gpt-oss:20b",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=10, temperature=0.0,
+            effort="low", num_ctx=4096, role="driver",
+        )
+
+
+def test_complete_native_happy_path(monkeypatch):
+    """Normal /api/chat response parses into a Completion correctly."""
+    import io
+    import json
+
+    p = _ollama_for_test()
+
+    payload = (
+        '{"model":"gpt-oss:20b",'
+        '"message":{"role":"assistant","content":"hello world"},'
+        '"done":true,"done_reason":"stop",'
+        '"prompt_eval_count":12,"eval_count":3}'
+    )
+
+    class FakeResponse:
+        def __init__(self, body): self._body = io.BytesIO(body.encode())
+        def __enter__(self): return self._body
+        def __exit__(self, *a): pass
+        def read(self, *a, **kw): return self._body.read(*a, **kw)
+
+    def _fake_urlopen(req, timeout=600):
+        # Verify we hit /api/chat, not /v1/chat/completions
+        assert req.full_url.endswith("/api/chat"), req.full_url
+        # Verify think=False is on the wire
+        body = json.loads(req.data.decode())
+        assert body["think"] is False
+        return FakeResponse(payload)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    comp = p.complete(
+        model="gpt-oss:20b",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=100, temperature=0.0,
+        effort="medium", num_ctx=8192, role="driver",
+    )
+    assert comp.content == "hello world"
+    assert comp.prompt_tokens == 12
+    assert comp.completion_tokens == 3
+    assert comp.finish_reason == "stop"

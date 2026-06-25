@@ -3,6 +3,44 @@
 All notable changes to Forge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] — 2026-06-25 — Ollama harmony tool-call wire fix
+
+### Fixed
+
+- **Ollama harmony tool-call HTTP 500 regression** (issue surfaced in real
+  sessions running `gpt-oss:20b` for filesystem queries). Ollama's
+  OpenAI-compatible `/v1/chat/completions` endpoint runs the model's output
+  through its **harmony** parser, which intermittently misclassifies plain
+  Python code blocks (from our intent+py output) as `python` tool calls,
+  then crashes JSON-parsing the source as tool arguments — surfacing as:
+  > `error parsing tool call: raw='from pathlib import Path...', err=invalid character 'r' in literal false`
+
+  This was a **wire-protocol** bug masquerading as a prompt-engineering
+  bug — no amount of "do NOT call tools" framing in the system prompt
+  prevents the server from running its parser. Fixed in two layers:
+
+  1. **Native endpoint by default.** `OllamaProvider` now talks to
+     `/api/chat` directly (via stdlib `urllib`) instead of going through
+     the OpenAI SDK's `/v1/chat/completions`. `think=False` rides on the
+     wire body, not in an `extra_body` shim. Streaming uses NDJSON from
+     the same endpoint.
+  2. **Parse-error recovery.** When Ollama's harmony parser does fire
+     and returns HTTP 500, we extract the model's raw output from the
+     `raw=...` field of the error body via regex and return it as a
+     `Completion` with `finish_reason="tool_call_parse_recovered"`. The
+     turn keeps moving instead of failing.
+
+  The legacy `/v1/chat/completions` path remains available behind
+  `FORGE_USE_V1_OLLAMA=1` as an escape hatch.
+
+### Tests
+
+- 6 new tests in `tests/test_router_providers.py` covering: raw-output
+  extraction from a parse-error body, parse-error → recovered Completion,
+  unrelated 4xx errors still raising, unreachable Ollama giving a friendly
+  error, and the happy path verifying `/api/chat` is hit with `think=False`
+  on the wire. Total: 418 tests passing (412 → 418).
+
 ## [0.2.1] — 2026-06-25 — production-grade hardening
 
 A polish release focused on **closing every known issue before broader

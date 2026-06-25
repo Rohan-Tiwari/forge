@@ -21,11 +21,13 @@ If the env var is missing, the provider raises a clear error on first use.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 
 # Forward refs — defined in router.py
@@ -263,27 +265,76 @@ def reload_pricing() -> dict[str, tuple[float, float]]:
 # =============================================================================
 
 
-class OllamaProvider:
-    """Talks to a local Ollama instance via its OpenAI-compatible /v1 endpoint.
+# Pattern Ollama uses when its harmony parser fails to interpret the model's
+# response as a tool call. The raw model output is embedded in the error
+# message, which means we can recover it. See:
+#   https://github.com/ollama/ollama/issues  (gpt-oss tool-call regressions)
+#
+# Example error body:
+#   {"error":{"message":"error parsing tool call: raw='from pathlib import
+#   Path\\np = Path(\"...\")\\n', err=invalid character 'r' in literal false..."}}
+_TOOL_CALL_PARSE_RE = re.compile(
+    r"error parsing tool call:\s*raw=['\"]?(.+?)['\"]?,\s*err=",
+    re.DOTALL,
+)
 
-    Bakes in the Day 0 fixes: think=False, no tools, temperature=0.
+
+class OllamaProvider:
+    """Talks to a local Ollama instance.
+
+    Two transport paths, in priority order:
+
+    1. **Native `/api/chat`** (default). Lets us pass `think=False` cleanly,
+       receive structured responses, AND see the raw model output even when
+       Ollama's harmony parser crashes on a tool-call interception (we
+       extract the raw= field from the error and treat it as the model's
+       output). This is the regression-safe path.
+
+    2. **OpenAI-compatible `/v1/chat/completions`** (legacy/fallback).
+       Used only when FORGE_USE_V1_OLLAMA=1 is set.
+
+    Bakes in the Day 0 fixes (`think=False`, `temperature=0`, no tools) but
+    those are now belt-and-braces — the real protection is the wire path
+    above, not the prompt.
     """
 
     name = "ollama"
 
     def __init__(self, base_url: str | None = None):
+        # We don't need the OpenAI SDK for the native path, but keep the
+        # client for the legacy v1 path (and for any caller that still
+        # passes a /v1 URL).
         from openai import OpenAI
         self.base_url = base_url or os.environ.get(
             "FORGE_OLLAMA_URL", "http://localhost:11434/v1"
         )
+        # Derive the native /api base by stripping /v1
+        if self.base_url.endswith("/v1"):
+            self.api_base = self.base_url[: -len("/v1")]
+        elif self.base_url.endswith("/v1/"):
+            self.api_base = self.base_url[: -len("/v1/")]
+        else:
+            self.api_base = self.base_url.rstrip("/")
         self.client = OpenAI(base_url=self.base_url, api_key="ollama")
+        self._use_v1 = os.environ.get("FORGE_USE_V1_OLLAMA") == "1"
 
     def handles(self, model: str) -> bool:
         # Default fallback — handles anything not claimed by a more specific
         # provider. The router puts us last in the chain.
         return True
 
-    def _extra_body(self, *, effort: str, num_ctx: int) -> dict:
+    def _native_options(self, *, effort: str, num_ctx: int) -> dict[str, Any]:
+        """Options dict for the native /api/chat endpoint."""
+        return {
+            "temperature": 0.0,
+            "num_ctx": num_ctx,
+            # gpt-oss models support a per-call reasoning hint via this field.
+            # Other models ignore it harmlessly.
+            "reasoning_effort": effort,
+        }
+
+    def _extra_body(self, *, effort: str, num_ctx: int) -> dict[str, Any]:
+        """Legacy v1 extra_body. Kept for FORGE_USE_V1_OLLAMA=1 callers."""
         return {
             "think": False,
             "reasoning_effort": effort,
@@ -291,8 +342,110 @@ class OllamaProvider:
             "keep_alive": os.environ.get("FORGE_KEEP_ALIVE", "24h"),
         }
 
+    def _extract_raw_from_tool_call_error(self, error_body: str) -> str | None:
+        """When Ollama's harmony parser fails, the model's raw output is
+        embedded in the error message. Extract it so we can recover.
+
+        Returns None if the error isn't this specific shape.
+        """
+        m = _TOOL_CALL_PARSE_RE.search(error_body)
+        if not m:
+            return None
+        raw = m.group(1)
+        # The captured content uses \n / \" escapes — un-escape them.
+        # Be conservative: only undo the escapes we actually see emitted.
+        raw = raw.replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'")
+        return raw
+
     def complete(self, *, model, messages, max_tokens, temperature,
                  effort, num_ctx, role) -> Completion:
+        if self._use_v1:
+            return self._complete_v1(
+                model=model, messages=messages, max_tokens=max_tokens,
+                temperature=temperature, effort=effort, num_ctx=num_ctx,
+                role=role,
+            )
+        return self._complete_native(
+            model=model, messages=messages, max_tokens=max_tokens,
+            temperature=temperature, effort=effort, num_ctx=num_ctx,
+            role=role,
+        )
+
+    def _complete_native(self, *, model, messages, max_tokens, temperature,
+                         effort, num_ctx, role) -> Completion:
+        """Native /api/chat path — regression-safe against the harmony
+        tool-call parser bug."""
+        import urllib.error
+        import urllib.request
+
+        body = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "think": False,                              # core Day 0 fix
+            "options": self._native_options(effort=effort, num_ctx=num_ctx),
+            "keep_alive": os.environ.get("FORGE_KEEP_ALIVE", "24h"),
+        }
+        req = urllib.request.Request(
+            self.api_base + "/api/chat",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                data = json.load(resp)
+        except urllib.error.HTTPError as e:
+            # The tool-call parse error case. Extract the model's raw
+            # output if present and surface IT as the response — better
+            # to attempt a recovery than to fail the whole turn.
+            body_bytes = e.read()
+            error_body = body_bytes.decode("utf-8", errors="replace")
+            raw = self._extract_raw_from_tool_call_error(error_body)
+            if raw is not None:
+                # We recovered the model's intended output. Wrap it as a
+                # synthetic Completion with finish_reason hinting at what
+                # happened (audit log will record this).
+                return Completion(
+                    content=raw,
+                    role_used=role,
+                    model_used=model,
+                    elapsed_s=time.monotonic() - t0,
+                    prompt_tokens=0,    # Ollama didn't tell us
+                    completion_tokens=0,
+                    cost_usd=0.0,       # local model
+                    finish_reason="tool_call_parse_recovered",
+                )
+            # Not the parse-error case — re-raise with context the router
+            # can see.
+            raise RuntimeError(
+                f"ollama HTTP {e.code}: {error_body[:500]}"
+            ) from e
+        except (urllib.error.URLError, OSError) as e:
+            raise RuntimeError(
+                f"ollama unreachable at {self.api_base}: {e}. "
+                f"Is `ollama serve` running?"
+            ) from e
+
+        msg = data.get("message", {})
+        content = msg.get("content", "") or ""
+
+        return Completion(
+            content=content,
+            role_used=role,
+            model_used=model,
+            elapsed_s=time.monotonic() - t0,
+            prompt_tokens=int(data.get("prompt_eval_count") or 0),
+            completion_tokens=int(data.get("eval_count") or 0),
+            cost_usd=price(model, int(data.get("prompt_eval_count") or 0),
+                           int(data.get("eval_count") or 0)),
+            finish_reason=str(data.get("done_reason") or "stop"),
+        )
+
+    def _complete_v1(self, *, model, messages, max_tokens, temperature,
+                     effort, num_ctx, role) -> Completion:
+        """Legacy /v1/chat/completions path. Kept for FORGE_USE_V1_OLLAMA=1."""
         t0 = time.monotonic()
         resp = self.client.chat.completions.create(
             model=model,
@@ -319,6 +472,117 @@ class OllamaProvider:
 
     def complete_stream(self, *, model, messages, max_tokens, temperature,
                         effort, num_ctx, role) -> Iterator[StreamChunk]:
+        if self._use_v1:
+            yield from self._complete_stream_v1(
+                model=model, messages=messages, max_tokens=max_tokens,
+                temperature=temperature, effort=effort, num_ctx=num_ctx,
+                role=role,
+            )
+            return
+        yield from self._complete_stream_native(
+            model=model, messages=messages, max_tokens=max_tokens,
+            temperature=temperature, effort=effort, num_ctx=num_ctx,
+            role=role,
+        )
+
+    def _complete_stream_native(self, *, model, messages, max_tokens, temperature,
+                                effort, num_ctx, role) -> Iterator[StreamChunk]:
+        """Native streaming path."""
+        import urllib.error
+        import urllib.request
+
+        body = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "think": False,
+            "options": self._native_options(effort=effort, num_ctx=num_ctx),
+            "keep_alive": os.environ.get("FORGE_KEEP_ALIVE", "24h"),
+        }
+        req = urllib.request.Request(
+            self.api_base + "/api/chat",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+        t0 = time.monotonic()
+        accumulated: list[str] = []
+        in_tokens = out_tokens = 0
+        finish_reason = ""
+
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                for line in resp:
+                    if not line.strip():
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = chunk.get("message", {})
+                    delta = msg.get("content") or ""
+                    if delta:
+                        accumulated.append(delta)
+                        yield StreamChunk(
+                            delta=delta,
+                            accumulated="".join(accumulated),
+                            is_final=False,
+                        )
+                    if chunk.get("done"):
+                        in_tokens = int(chunk.get("prompt_eval_count") or 0)
+                        out_tokens = int(chunk.get("eval_count") or 0)
+                        finish_reason = str(chunk.get("done_reason") or "stop")
+        except urllib.error.HTTPError as e:
+            # Stream-mode tool-call parse error — try the same recovery.
+            body_bytes = e.read()
+            error_body = body_bytes.decode("utf-8", errors="replace")
+            raw = self._extract_raw_from_tool_call_error(error_body)
+            if raw is not None:
+                # Synthesize a single-chunk stream with the recovered content
+                comp = Completion(
+                    content=raw,
+                    role_used=role,
+                    model_used=model,
+                    elapsed_s=time.monotonic() - t0,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    cost_usd=0.0,
+                    finish_reason="tool_call_parse_recovered",
+                )
+                yield StreamChunk(
+                    delta=raw, accumulated=raw, is_final=False,
+                )
+                yield StreamChunk(
+                    delta="", accumulated=raw, is_final=True,
+                    completion=comp,
+                )
+                return
+            raise RuntimeError(
+                f"ollama HTTP {e.code}: {error_body[:500]}"
+            ) from e
+        except (urllib.error.URLError, OSError) as e:
+            raise RuntimeError(
+                f"ollama unreachable at {self.api_base}: {e}"
+            ) from e
+
+        full = "".join(accumulated)
+        comp = Completion(
+            content=full,
+            role_used=role,
+            model_used=model,
+            elapsed_s=time.monotonic() - t0,
+            prompt_tokens=in_tokens,
+            completion_tokens=out_tokens,
+            cost_usd=price(model, in_tokens, out_tokens),
+            finish_reason=finish_reason,
+        )
+        yield StreamChunk(
+            delta="", accumulated=full, is_final=True, completion=comp,
+        )
+
+    def _complete_stream_v1(self, *, model, messages, max_tokens, temperature,
+                            effort, num_ctx, role) -> Iterator[StreamChunk]:
+        """Legacy v1 streaming path."""
         t0 = time.monotonic()
         stream = self.client.chat.completions.create(
             model=model,
