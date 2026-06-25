@@ -8,9 +8,6 @@ go wrong (timeout, big workspace, syntax error, etc.).
 from __future__ import annotations
 
 import textwrap
-from pathlib import Path
-
-import pytest
 
 from forge.gate import check
 from forge.preview import FileChange, Preview

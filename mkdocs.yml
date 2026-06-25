@@ -1,0 +1,77 @@
+site_name: Forge
+site_description: Code-first local agent with skills, multi-provider routing, sandbox safety, and trust-mode rails
+site_url: https://Rohan-Tiwari.github.io/forge/
+repo_url: https://github.com/Rohan-Tiwari/forge
+repo_name: Rohan-Tiwari/forge
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Architecture: architecture.md
+  - CLI reference: cli.md
+  - Writing skills: skills.md
+  - Safety model: SAFETY.md
+  - Audit report (v0.2.1): V021-AUDIT.json
+  - Dogfood report (W4): W4-DOGFOOD.md
+  - API reference:
+      - forge.session: api/session.md
+      - forge.gate: api/gate.md
+      - forge.tools: api/tools.md
+      - forge.errors: api/errors.md
+  - Contributing: ../CONTRIBUTING.md
+  - Security: ../SECURITY.md
+  - Changelog: ../CHANGELOG.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [../src]
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            heading_level: 2
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - tables
+  - toc:
+      permalink: true

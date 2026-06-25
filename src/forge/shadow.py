@@ -28,7 +28,6 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass
@@ -89,7 +88,7 @@ class ShadowGit:
 
     # ---- commit / log / undo --------------------------------------------
 
-    def commit(self, message: str, *, allow_empty: bool = True) -> Optional[ShadowCommit]:
+    def commit(self, message: str, *, allow_empty: bool = True) -> ShadowCommit | None:
         """Stage everything and commit. Returns the commit, or None on benign failure.
 
         Failures we swallow:
@@ -142,7 +141,7 @@ class ShadowGit:
             return f"(no such commit: {sha})"
         return self._git("show", "--stat", "-p", sha, check=False).stdout
 
-    def undo_last(self) -> Optional[ShadowCommit]:
+    def undo_last(self) -> ShadowCommit | None:
         """Restore the working tree to the state before the most recent commit.
 
         Uses `git read-tree --reset -u <prev>` followed by `git clean -fd`,

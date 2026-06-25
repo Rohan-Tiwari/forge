@@ -36,12 +36,10 @@ import shutil
 import subprocess
 import threading
 import time
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
-
-import tomllib
-
+from typing import Any
 
 _MCP_CONFIG_PATH = Path(
     os.environ.get("FORGE_MCP_CONFIG",
@@ -86,10 +84,10 @@ class MCPServerConfig:
     cmd: str
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    cwd: Optional[str] = None
+    cwd: str | None = None
 
 
-def load_config(path: Optional[Path] = None) -> dict[str, MCPServerConfig]:
+def load_config(path: Path | None = None) -> dict[str, MCPServerConfig]:
     """Load ~/.forge/mcp.toml. Returns empty dict if absent."""
     p = path or _MCP_CONFIG_PATH
     if not p.exists():
@@ -140,12 +138,12 @@ class MCPSession:
 
     def __init__(self, config: MCPServerConfig):
         self.config = config
-        self.proc: Optional[subprocess.Popen[str]] = None
+        self.proc: subprocess.Popen[str] | None = None
         self.tools: dict[str, MCPTool] = {}
         self._lock = threading.Lock()
         self._next_id = 0
         self._stderr_buf: list[str] = []
-        self._stderr_thread: Optional[threading.Thread] = None
+        self._stderr_thread: threading.Thread | None = None
         self._initialized = False
 
     # ---- lifecycle ------------------------------------------------------
@@ -243,7 +241,7 @@ class MCPSession:
             self._stderr_thread.join(timeout=1)
             self._stderr_thread = None
 
-    def __enter__(self) -> "MCPSession":
+    def __enter__(self) -> MCPSession:
         self.start()
         return self
 
@@ -257,7 +255,7 @@ class MCPSession:
         return self._next_id
 
     def _send(self, method: str, params: dict | None = None,
-              *, notification: bool = False) -> Optional[int]:
+              *, notification: bool = False) -> int | None:
         """Send a JSON-RPC request or notification. Returns the id (None for notifications)."""
         if self.proc is None or self.proc.stdin is None:
             raise MCPError(f"MCP {self.config.name}: not started")

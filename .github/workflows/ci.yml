@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint with ruff
+        run: ruff check src/ tests/
+
+      - name: Run tests (no live integration)
+        run: pytest tests/ --timeout=30 -m "not slow" -v
+        env:
+          # Make sure no provider keys leak into the test runs
+          FORGE_LOG_LEVEL: WARNING
+          # Don't try to connect to a real Ollama
+          FORGE_OLLAMA_URL: "http://invalid.example:11434/v1"
+
+      - name: Test build wheel + sdist
+        run: |
+          pip install build
+          python -m build --wheel --sdist
+          ls -la dist/
+
+      - name: Verify wheel installs
+        run: |
+          pip install dist/*.whl
+          forge --version
+
+  type-check:
+    # mypy is informational for v0.2.1 — runs on PRs but doesn't gate merges
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: |
+          pip install -e ".[dev]"
+          mypy src/ --no-strict-optional --ignore-missing-imports || true

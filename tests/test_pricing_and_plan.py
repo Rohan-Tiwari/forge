@@ -2,25 +2,21 @@
 from __future__ import annotations
 
 import textwrap
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
-from unittest.mock import patch
 
 import pytest
 
 from forge import providers
 from forge.providers import (
-    Completion,
-    StreamChunk,
     _PRICING_BASELINE,
+    Completion,
     _load_pricing_override,
     price,
     reload_pricing,
 )
-from forge.router import Completion as RouterCompletion
 from forge.router import RoleConfig
 from forge.session import Session
-
 
 # =============================================================================
 # Pricing override

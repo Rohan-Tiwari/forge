@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator, Optional, Protocol
+from typing import Protocol
 
 
 # Forward refs — defined in router.py
@@ -49,7 +50,7 @@ class StreamChunk:
     delta: str
     accumulated: str
     is_final: bool = False
-    completion: Optional[Completion] = None
+    completion: Completion | None = None
 
 
 class Provider(Protocol):
@@ -180,7 +181,7 @@ _PRICING_OVERRIDE: dict[str, tuple[float, float]] = _load_pricing_override()
 _PRICING_OVERRIDE_MTIME: float = 0.0
 
 
-def _pricing_path() -> "Path":
+def _pricing_path() -> Path:
     from pathlib import Path
     return Path.home() / ".forge" / "pricing.toml"
 
@@ -270,7 +271,7 @@ class OllamaProvider:
 
     name = "ollama"
 
-    def __init__(self, base_url: Optional[str] = None):
+    def __init__(self, base_url: str | None = None):
         from openai import OpenAI
         self.base_url = base_url or os.environ.get(
             "FORGE_OLLAMA_URL", "http://localhost:11434/v1"
@@ -391,7 +392,7 @@ class AnthropicProvider:
                 "anthropic SDK not installed. Run: pip install anthropic"
             ) from e
         self.api_key = os.environ.get("ANTHROPIC_API_KEY")
-        self._client: Optional[object] = None
+        self._client: object | None = None
 
     def _ensure_client(self):
         if self._client is None:
@@ -517,10 +518,10 @@ class OpenAIProvider:
     name = "openai"
 
     def __init__(self):
-        from openai import OpenAI as _OAI
-        self._OAI = _OAI
+        from openai import OpenAI as _OAI  # noqa: N814 — kept as ctor handle
+        self._OAI = _OAI  # noqa: N815
         self.api_key = os.environ.get("OPENAI_API_KEY")
-        self._client: Optional[object] = None
+        self._client: object | None = None
 
     def _ensure_client(self):
         if self._client is None:

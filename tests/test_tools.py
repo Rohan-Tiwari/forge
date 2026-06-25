@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -15,12 +14,10 @@ from forge.tools import (
     ProtectedPathError,
     Read,
     Write,
-    assert_writable,
     install_builtin_guards,
     is_protected_path,
     uninstall_builtin_guards,
 )
-
 
 # =============================================================================
 # is_protected_path
@@ -212,7 +209,7 @@ def test_builtin_guards_block_protected_read():
     install_builtin_guards()
     try:
         with pytest.raises(ProtectedPathError):
-            open(os.path.expanduser("~/.ssh/id_rsa"), "r")
+            open(os.path.expanduser("~/.ssh/id_rsa"))
     finally:
         uninstall_builtin_guards()
 

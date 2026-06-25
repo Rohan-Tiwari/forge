@@ -3,6 +3,112 @@
 All notable changes to Forge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] — 2026-06-25 — production-grade hardening
+
+A polish release focused on **closing every known issue before broader
+distribution**. 412 tests passing (+ 69 from v0.2.0). 5 critical security
+findings from an internal audit closed; 7 deferred dogfood findings closed.
+
+### Security (5 critical findings from `docs/V021-AUDIT.json`)
+
+- **Sandbox network rule was a silent no-op.** `_make_network_rules` emitted
+  a bare `(allow network-outbound)` whenever the allowlist was non-empty,
+  and the default kernel config passed `["localhost", "127.0.0.1"]` — so
+  the sandbox profile literally allowed arbitrary outbound traffic. Fixed:
+  emit informational comments only; sandbox-exec cannot filter by hostname,
+  so non-localhost outbound is now genuinely denied. (commit `9cefc7b`)
+- **Git argument injection in installer.** A crafted ref like
+  `--upload-pack=/path/evil` was passed positionally to `git fetch` and
+  `git checkout`, allowing arbitrary local binary execution during clone.
+  Fixed: `re.fullmatch(r"[A-Za-z0-9._/-]+")` validation, reject leading
+  `-`, reject `..`, use `--` positional separator. Also clone now uses
+  isolated git config so smudge filters / hooks / credential helpers
+  can't run.
+- **MCP unbounded readline + RecursionError.** A hostile MCP server could
+  OOM the parent via unbounded `stdout.readline()`; deeply nested JSON
+  raised `RecursionError` which escaped the loop. Fixed: 1MB line cap +
+  catch `RecursionError`.
+- **Dry-run absolute-path escape.** The dry-run subprocess set `cwd=overlay`
+  but had no FS jail. Cells writing to absolute paths or with `..` reached
+  the real filesystem and were INVISIBLE to the preview. Fixed: wrap
+  Write/Edit/open with `_path_inside_overlay` guard; fail closed on
+  forge.tools import error (no more permissive stdlib fallback).
+- **Provider secrets inherited into every subprocess.** Kernel worker, MCP
+  servers, AND dry-run subprocess all used `os.environ.copy()`, exposing
+  `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GITHUB_TOKEN` to any spawned
+  process. Fixed: new `forge._subprocess_env.build_minimal_env()` builds
+  child env from a strict allowlist (PATH, HOME, USER, LANG, etc.) plus
+  caller-supplied extras. Wired into all three spawn sites.
+
+### Deferred dogfood findings from W4-DOGFOOD.md (commit `1895702`)
+
+- `#4` Plan-mode help text clarified re: `.forge/` workspace bootstrap
+- `#5` Planner prompt rewritten with "minimal one-shot solutions" principle
+- `#6` `forge run --show-stdout` flag adds last cell's stdout to reply panel
+- `#9` `forge skill search` disambiguates "no matches" vs "rate-limited"
+- `#10` `_load_pricing_override` now logs warnings via `logging.warning`
+- `#11` Pricing.toml hot-reload — `price()` stats the file on every call
+- `#12` `_PRICING` merged dict has inspection-only comment
+
+### Infrastructure
+
+- **`forge.log` module** — structured logging via stdlib `logging`. `FORGE_LOG_LEVEL`
+  env var + `FORGE_LOG_FILE` for rotating-file output. Idempotent
+  `setup_logging()`. Wired into CLI startup.
+- **`forge.errors` module** — unified `ForgeError` exception hierarchy.
+  Legacy exceptions registered as virtual subclasses via `ABCMeta.register`
+  so `isinstance(err, ForgeError)` works without touching their `__bases__`.
+- **`~/.forge/config.toml`** — optional user-level defaults (`ollama_url`,
+  `driver_model`, `num_ctx`, `keep_alive`, `cost_ceiling_usd`). Layered
+  under env vars, layered over hardcoded defaults. See
+  `examples/sample-config.toml`.
+- **Ruff clean across `src/` + `tests/`.** 220+ auto-fixed; remaining
+  ignores documented in `pyproject.toml` with rationale.
+- **CI workflow** (`.github/workflows/ci.yml`): pytest + ruff on
+  macos-latest + ubuntu-latest across Python 3.11/3.12/3.13. Build check
+  verifies wheel + sdist generate correctly.
+- **Publish workflow** (`.github/workflows/publish.yml`): tag-triggered
+  PyPI publishing via Trusted Publishing. `-rc` tags → Test PyPI; stable
+  tags → real PyPI.
+- **Pre-commit hooks** (`.pre-commit-config.yaml`): ruff format + ruff
+  check + trailing-whitespace + end-of-file-fixer + check-toml + a custom
+  leak-scan hook that blocks commits containing GitHub PATs / Anthropic /
+  OpenAI keys.
+- **Release script** (`scripts/release.sh`): one-command version bump
+  + CHANGELOG section + tag + push for patch/minor/major/rc.
+- **PyPI metadata complete.** `forge_agent-0.2.1-py3-none-any.whl` builds
+  and passes `twine check`. `py.typed` marker for downstream type-checkers.
+  Full `[tool.hatch.build.targets.sdist]` include list for reproducible
+  source distributions.
+- **CONTRIBUTING.md + SECURITY.md** added.
+- **MkDocs site** (`mkdocs.yml`, `docs/index.md`, `docs/quickstart.md`):
+  Material theme, mkdocstrings auto-API, ready to deploy to GitHub Pages.
+
+### Tests
+
+**412 passing** (up from 343). New test suites:
+
+- `test_log_and_errors.py` (23 tests) — logger config + hierarchy
+- `test_config.py` (9 tests) — env / config.toml / defaults layering
+- `test_security_fixes.py` (37 tests) — every critical finding has a
+  regression test (the git ref exploit vector is parametrized with the
+  exact `--upload-pack=/path/evil` payload)
+
+### Deps
+
+- `+build>=1.0` (dev — sdist/wheel build verification)
+- `+twine>=5.0` (dev — PyPI metadata validation)
+- `+pytest-timeout>=2.4` (dev — already used, now declared)
+- `+mkdocs>=1.6`, `+mkdocs-material>=9.5`, `+mkdocstrings[python]>=0.27`
+  (docs — optional extra, `pip install forge-agent[docs]`)
+
+### Internal documentation
+
+- `docs/V021-AUDIT.json` — full structured audit output (input to v0.2.1 work)
+- `docs/W4-DOGFOOD.md` — the dogfood report from the prior release
+
+---
+
 ## [0.2.0] — 2026-06-24 — Waves 1-4
 
 Major release. 5 waves of features, **331 tests passing**, ~9,000 LOC of

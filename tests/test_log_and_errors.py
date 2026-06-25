@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import pytest
 
 from forge import errors as forge_errors
 from forge.log import get_logger, is_configured, setup_logging
-
 
 # =============================================================================
 # Logging

@@ -33,7 +33,6 @@ import tempfile
 from dataclasses import dataclass, field
 from difflib import unified_diff
 from pathlib import Path
-from typing import Optional
 
 from forge.gate import GateDecision, IntentBlock
 
@@ -44,7 +43,7 @@ class FileChange:
 
     path: str
     kind: str               # "create" | "modify" | "delete" | "unknown"
-    diff: Optional[str] = None  # unified diff (None for create or unknown)
+    diff: str | None = None  # unified diff (None for create or unknown)
     bytes_in: int = 0
     bytes_out_estimate: int = 0
 
@@ -59,7 +58,7 @@ class Preview:
     network_calls: list[str] = field(default_factory=list)
     bash_commands: list[str] = field(default_factory=list)
     flagged_reasons: list[str] = field(default_factory=list)
-    syntax_error: Optional[str] = None
+    syntax_error: str | None = None
 
     @property
     def has_side_effects(self) -> bool:
@@ -83,7 +82,7 @@ class Preview:
     # ---- factory ------------------------------------------------------
 
     @classmethod
-    def from_gate(cls, gate: GateDecision, *, workspace: Path | None = None) -> "Preview":
+    def from_gate(cls, gate: GateDecision, *, workspace: Path | None = None) -> Preview:
         """Build a static preview from a GateDecision (no execution)."""
         if gate.intent is None or gate.findings is None:
             return cls(
@@ -98,7 +97,7 @@ class Preview:
         code = ""  # filled by caller via Preview.with_code
 
         file_changes: list[FileChange] = []
-        for func, target in gate.findings.write_calls:
+        for _func, target in gate.findings.write_calls:
             if not target:
                 continue
             change = _build_file_change(target, workspace)
@@ -117,7 +116,7 @@ class Preview:
             syntax_error=gate.findings.syntax_error,
         )
 
-    def with_code(self, code: str) -> "Preview":
+    def with_code(self, code: str) -> Preview:
         """Return a copy with the source code attached."""
         self.code = code
         return self
@@ -133,7 +132,7 @@ class Preview:
         workspace: Path,
         max_workspace_mb: float = 50.0,
         timeout_s: float = 30.0,
-    ) -> "Preview":
+    ) -> Preview:
         """Build a preview by ACTUALLY running the cell against an overlay.
 
         Strategy:

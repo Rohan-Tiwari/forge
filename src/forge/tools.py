@@ -20,15 +20,17 @@ import re
 import shutil as _shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from forge.config import (
     EFFECTIVE_PROTECTED_ACTIONS as PROTECTED_ACTIONS,
+)
+from forge.config import (
     EFFECTIVE_PROTECTED_PATHS as PROTECTED_PATHS,
 )
-
 
 # =============================================================================
 # Errors
@@ -145,7 +147,7 @@ def assert_readable(path: str | os.PathLike[str]) -> None:
 # =============================================================================
 
 
-def _bash_command_is_protected(cmd: str) -> Optional[str]:
+def _bash_command_is_protected(cmd: str) -> str | None:
     """Return the matching pattern if cmd contains a protected action, else None.
 
     Conservative substring + word-boundary check. Pattern matching is
@@ -246,7 +248,7 @@ class BashResult:
         return head
 
 
-def Bash(cmd: str, *, timeout: int = 120, cwd: Optional[str | os.PathLike[str]] = None) -> BashResult:
+def Bash(cmd: str, *, timeout: int = 120, cwd: str | os.PathLike[str] | None = None) -> BashResult:
     """Run a shell command. Refuses protected actions (sudo, rm -rf /, etc).
 
     NOTE: This uses `shell=True` because that matches how a developer would
@@ -368,7 +370,6 @@ def see(image: str | os.PathLike[str] | bytes,
     import hashlib
     import json as _json
     import os as _os
-    import time
     import urllib.request
 
     # ---- resolve input to bytes ------------------------------------------
@@ -480,10 +481,10 @@ def call_mcp(server: str, tool: str, **arguments: Any) -> Any:
 
 def set_skill_runtime(
     *,
-    find: Optional[Callable[[str], list[dict[str, Any]]]] = None,
-    run: Optional[Callable[..., Any]] = None,
-    see_fn: Optional[Callable[[Any], str]] = None,  # deprecated; see() is real now
-    mcp: Optional[Callable[..., Any]] = None,
+    find: Callable[[str], list[dict[str, Any]]] | None = None,
+    run: Callable[..., Any] | None = None,
+    see_fn: Callable[[Any], str] | None = None,  # deprecated; see() is real now
+    mcp: Callable[..., Any] | None = None,
 ) -> None:
     """Wire the skill / MCP callbacks. Called by Session.start().
 
@@ -524,10 +525,10 @@ _INSTALLED = False
 # We keep the originals only inside the install closure, not as module attrs.
 # `__OPEN__` is named to be hard to guess but it's not a security boundary —
 # just a convenience for uninstall/idempotency.
-__OPEN__: Optional[Callable[..., Any]] = None
-__OS_OPEN__: Optional[Callable[..., Any]] = None
-__SUBPROC_RUN__: Optional[Callable[..., Any]] = None
-__SUBPROC_POPEN__: Optional[Callable[..., type]] = None
+__OPEN__: Callable[..., Any] | None = None
+__OS_OPEN__: Callable[..., Any] | None = None
+__SUBPROC_RUN__: Callable[..., Any] | None = None
+__SUBPROC_POPEN__: Callable[..., type] | None = None
 __SHUTIL_FUNCS__: dict[str, Callable[..., Any]] = {}
 
 

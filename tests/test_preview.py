@@ -1,12 +1,8 @@
 """Tests for forge.preview — what the user sees before approving."""
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
-
 from forge.gate import check
-from forge.preview import FileChange, Preview
+from forge.preview import Preview
 
 
 def _gate(text: str):

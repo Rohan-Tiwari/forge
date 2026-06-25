@@ -1,16 +1,14 @@
 """Tests for streaming completion and the prompt_toolkit REPL."""
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterator
 
 import pytest
 
 from forge.repl import SLASH_COMMANDS, is_slash_command, make_session
 from forge.router import Completion, StreamChunk
 from forge.session import Session
-
 
 # =============================================================================
 # Fake router with streaming support — used by streaming tests.

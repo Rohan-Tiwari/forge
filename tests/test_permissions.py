@@ -8,7 +8,6 @@ from forge.permissions import (
     actions_for_preview,
 )
 
-
 # ---- Action.to_pattern ----------------------------------------------------
 
 
@@ -101,8 +100,8 @@ def test_store_load_persistent(tmp_path, monkeypatch):
 
 
 def test_actions_for_preview_extracts_each_kind():
-    from forge.preview import FileChange, Preview
     from forge.gate import IntentBlock
+    from forge.preview import FileChange, Preview
     p = Preview(
         intent=IntentBlock(intent="x"),
         code="",

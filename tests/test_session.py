@@ -5,15 +5,13 @@ We script a sequence of Completion objects and verify the loop behaves.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterator
 
 import pytest
 
 from forge.router import Completion
 from forge.session import Session
-
 
 # =============================================================================
 # Fake router — yields a scripted sequence of completions.

@@ -23,11 +23,9 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
-
-import tomllib
 
 try:
     import tomli_w  # for writing
@@ -49,7 +47,7 @@ class PermissionGrant:
     pattern: str
     kind: str = "allow"   # "allow" | "always_confirm"
 
-    def matches(self, action: "Action") -> bool:
+    def matches(self, action: Action) -> bool:
         """Does this grant cover the given action?"""
         return _action_matches_pattern(action, self.pattern)
 
@@ -168,7 +166,7 @@ class PermissionStore:
     persistent_grants: list[PermissionGrant] = field(default_factory=list)
 
     @classmethod
-    def load(cls) -> "PermissionStore":
+    def load(cls) -> PermissionStore:
         """Load persistent grants from ~/.forge/permissions.toml."""
         store = cls()
         if not PERMISSIONS_PATH.exists():

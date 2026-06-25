@@ -1,0 +1,38 @@
+# Pre-commit hooks for Forge.
+#
+# Install:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually:
+#   pre-commit run --all-files
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.md$
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: forge-leak-scan
+        name: Scan for accidentally-committed secrets
+        entry: bash -c 'git diff --cached -p | grep -iE "(github_pat_|gho_|ghp_|sk-ant-[a-z0-9]{30}|sk-proj-[a-z0-9]{30})" && echo "POSSIBLE TOKEN LEAK" && exit 1 || exit 0'
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]

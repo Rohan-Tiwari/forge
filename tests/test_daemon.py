@@ -8,21 +8,16 @@ from __future__ import annotations
 
 import textwrap
 import time
-from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
 from forge.daemon import (
-    DaemonConfig,
-    ScheduleConfig,
     WatcherConfig,
     _DebouncedHandler,
     _parse_cron_field,
     cron_matches,
     load_config,
 )
-
 
 # =============================================================================
 # Cron parser

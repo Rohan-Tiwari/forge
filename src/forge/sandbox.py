@@ -38,11 +38,8 @@ from __future__ import annotations
 import os
 import platform
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
-
 
 # =============================================================================
 # Platform detection
@@ -209,7 +206,7 @@ def _make_network_rules(allowed_hosts: list[str]) -> str:
 def build_profile(
     *,
     workspace: Path,
-    allowed_network_hosts: Optional[list[str]] = None,
+    allowed_network_hosts: list[str] | None = None,
 ) -> str:
     """Build a sandbox-exec profile for a Forge kernel.
 
@@ -249,8 +246,8 @@ def wrap_command(
     command: list[str],
     *,
     workspace: Path,
-    allowed_network_hosts: Optional[list[str]] = None,
-) -> tuple[list[str], Optional[Path]]:
+    allowed_network_hosts: list[str] | None = None,
+) -> tuple[list[str], Path | None]:
     """Prefix `command` with sandbox-exec invocation.
 
     Returns (wrapped_command, profile_path). If the platform doesn't

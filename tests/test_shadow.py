@@ -1,8 +1,6 @@
 """Tests for forge.shadow — git-based undo."""
 from __future__ import annotations
 
-from pathlib import Path
-
 from forge.shadow import ShadowGit
 
 

@@ -34,15 +34,13 @@ import re
 import shutil
 import subprocess
 import time
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import tomli_w
-import tomllib
 
 from forge.config import SKILLS_HOME
-
 
 _INSTALLED_ROOT = SKILLS_HOME / "installed"
 _MANIFEST_PATH = SKILLS_HOME / "manifest.toml"
@@ -101,7 +99,7 @@ class SkillSpec:
     ref: str            # 'a3f9c2c' (sha) or 'main' (tag)
     source: str         # 'github.com/alice/skills' (used as the on-disk source dir)
     name: str           # 'skills' (the repo basename, used as install name)
-    subdir: Optional[str] = None  # if user wants only one skill from a multi-skill repo
+    subdir: str | None = None  # if user wants only one skill from a multi-skill repo
 
 
 _GITHUB_SHORTHAND = re.compile(r"^([\w.-]+)/([\w.-]+)$")
@@ -386,7 +384,7 @@ class InstallPlan:
         return [f for f in self.findings if f.severity == "critical"]
 
 
-def _git(*args: str, cwd: Optional[Path] = None,
+def _git(*args: str, cwd: Path | None = None,
          check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # noqa: S603,S607
         ["git", *args],
@@ -398,7 +396,7 @@ def _git(*args: str, cwd: Optional[Path] = None,
 
 
 def prepare_install(spec: SkillSpec, *, allow_floating: bool = False,
-                    work_root: Optional[Path] = None) -> InstallPlan:
+                    work_root: Path | None = None) -> InstallPlan:
     """Clone + scan a skill repo, return an InstallPlan.
 
     Doesn't move anything to the final location — that's `execute_install`.
@@ -635,9 +633,9 @@ def search_skills(query: str, *, limit: int = 10) -> dict[str, Any]:
     """
     import json
     import os
+    import urllib.error
     import urllib.parse
     import urllib.request
-    import urllib.error
 
     q = (query.strip() + " topic:forge-skill" if query.strip()
          else "topic:forge-skill")
@@ -700,7 +698,7 @@ def search_skills(query: str, *, limit: int = 10) -> dict[str, Any]:
     }
 
 
-def latest_sha(owner: str, repo: str, ref: str = "HEAD") -> Optional[str]:
+def latest_sha(owner: str, repo: str, ref: str = "HEAD") -> str | None:
     """Look up the latest sha for a ref. Used by `forge skill update` to
     discover whether an upgrade exists without needing a local clone.
 

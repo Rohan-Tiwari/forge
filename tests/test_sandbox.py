@@ -10,7 +10,6 @@ the boundary actually fires.
 """
 from __future__ import annotations
 
-import os
 import platform
 import shutil
 import subprocess
@@ -22,10 +21,9 @@ import pytest
 from forge.sandbox import (
     build_profile,
     is_supported,
-    write_profile,
     wrap_command,
+    write_profile,
 )
-
 
 # =============================================================================
 # Profile generation — platform-independent

@@ -38,8 +38,6 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
-
 
 # Format: timestamp, level, module name (last component only), message.
 # Verbose enough to triage from a log paste; short enough to read at a glance.
@@ -67,8 +65,8 @@ def get_logger(name: str) -> logging.Logger:
 
 def setup_logging(
     *,
-    level: Optional[str] = None,
-    file: Optional[Path] = None,
+    level: str | None = None,
+    file: Path | None = None,
     silent: bool = False,
 ) -> None:
     """Configure forge's logging. Call once at program startup.

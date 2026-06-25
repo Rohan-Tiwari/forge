@@ -1,8 +1,6 @@
 """Tests for forge.kernel — subprocess executor."""
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from forge.kernel import Kernel

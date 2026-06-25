@@ -36,8 +36,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
-
+from typing import Any
 
 _RESULT_FD = 3  # dedicated fd in the worker for our result lines
 _RESULT_PREFIX = "\x1eFORGE_RESULT\x1e"  # still useful as a sanity tag
@@ -249,15 +248,15 @@ class Kernel:
     def __init__(self, *, workspace: Path, sandboxed: bool = True):
         self.workspace = workspace.resolve()
         self.sandboxed = sandboxed
-        self.proc: Optional[subprocess.Popen[str]] = None
+        self.proc: subprocess.Popen[str] | None = None
         self.health = KernelHealth()
         self._stderr_buf: deque[str] = deque(maxlen=1000)
-        self._stderr_thread: Optional[threading.Thread] = None
-        self._result_pipe_r: Optional[int] = None
-        self._result_reader: Optional[Any] = None
+        self._stderr_thread: threading.Thread | None = None
+        self._result_pipe_r: int | None = None
+        self._result_reader: Any | None = None
         self._exec_lock = threading.Lock()
         self._next_nonce = 0
-        self._sandbox_profile_path: Optional[Path] = None
+        self._sandbox_profile_path: Path | None = None
 
     def _new_nonce(self) -> str:
         self._next_nonce += 1
@@ -391,7 +390,7 @@ class Kernel:
 
         self.proc = None
 
-    def __enter__(self) -> "Kernel":
+    def __enter__(self) -> Kernel:
         self.start()
         return self
 
@@ -431,7 +430,7 @@ class Kernel:
         # Read result line from fd 3 with a manual timeout via select.
         # Worker writes one line per cell; we accept the first valid JSON line
         # whose nonce matches.
-        result: Optional[dict] = None
+        result: dict | None = None
         deadline = t0 + timeout
         result_fd = self._result_reader
 

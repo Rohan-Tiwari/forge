@@ -10,8 +10,8 @@ Covers the top dogfood findings:
 from __future__ import annotations
 
 import textwrap
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import pytest
 from typer.testing import CliRunner
@@ -19,7 +19,6 @@ from typer.testing import CliRunner
 from forge.cli import app
 from forge.router import Completion, RoleConfig
 from forge.session import Session
-
 
 # =============================================================================
 # Plan-mode refusal handling (rank 1)

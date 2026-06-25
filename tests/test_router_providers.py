@@ -5,8 +5,8 @@ output, so these tests don't burn real API calls.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Iterator
 
 import pytest
 
@@ -15,7 +15,6 @@ from forge.providers import (
     Completion,
     OllamaProvider,
     OpenAIProvider,
-    Provider,
     StreamChunk,
     price,
 )
@@ -25,7 +24,6 @@ from forge.router import (
     ModelRouter,
     RoleConfig,
 )
-
 
 # =============================================================================
 # Fake providers — used to exercise router logic without network

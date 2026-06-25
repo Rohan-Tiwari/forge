@@ -32,18 +32,15 @@ from __future__ import annotations
 import fnmatch
 import os
 import signal
-import sys
-import time
 import threading
+import time
+import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
-
-import tomllib
 
 from forge.config import FORGE_HOME
 from forge.session import Session
-
 
 _DAEMON_CONFIG_PATH = FORGE_HOME / "daemon.toml"
 _DAEMON_PID_PATH = FORGE_HOME / "daemon.pid"
@@ -63,7 +60,7 @@ class WatcherConfig:
     event: str = "created"  # created | modified | any
     task: str = ""
     cooldown_s: float = 5.0
-    workspace: Optional[Path] = None
+    workspace: Path | None = None
 
 
 @dataclass
@@ -71,7 +68,7 @@ class ScheduleConfig:
     name: str
     cron: str
     task: str = ""
-    workspace: Optional[Path] = None
+    workspace: Path | None = None
 
 
 @dataclass
@@ -80,7 +77,7 @@ class DaemonConfig:
     schedules: list[ScheduleConfig] = field(default_factory=list)
 
 
-def load_config(path: Optional[Path] = None) -> DaemonConfig:
+def load_config(path: Path | None = None) -> DaemonConfig:
     """Read ~/.forge/daemon.toml. Returns empty config if absent."""
     p = path or _DAEMON_CONFIG_PATH
     cfg = DaemonConfig()
@@ -195,7 +192,7 @@ def run_trigger(
     *,
     task: str,
     workspace: Path,
-    substitutions: Optional[dict[str, str]] = None,
+    substitutions: dict[str, str] | None = None,
     log_fn: Callable[[str], None] = print,
 ) -> None:
     """Invoke a Session.turn() in auto mode. Used by both watchers and schedules.
@@ -328,14 +325,14 @@ class Daemon:
         self,
         config: DaemonConfig,
         *,
-        workspace_default: Optional[Path] = None,
+        workspace_default: Path | None = None,
         log_fn: Callable[[str], None] = print,
     ):
         self.config = config
         self.workspace_default = workspace_default or Path.cwd()
         self.log_fn = log_fn
         self._observers: list = []
-        self._scheduler_thread: Optional[threading.Thread] = None
+        self._scheduler_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
     def start(self) -> None:
@@ -428,7 +425,7 @@ def write_pid(pid: int) -> None:
     _DAEMON_PID_PATH.write_text(str(pid))
 
 
-def read_pid() -> Optional[int]:
+def read_pid() -> int | None:
     if not _DAEMON_PID_PATH.exists():
         return None
     try:

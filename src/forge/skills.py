@@ -20,13 +20,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
 
 from forge.config import SKILLS_HOME
-
 
 # =============================================================================
 # Schema
@@ -65,12 +64,12 @@ class Skill:
         return self.frontmatter.description
 
     @property
-    def helpers_path(self) -> Optional[Path]:
+    def helpers_path(self) -> Path | None:
         p = self.path / "helpers.py"
         return p if p.exists() else None
 
     @property
-    def references_dir(self) -> Optional[Path]:
+    def references_dir(self) -> Path | None:
         p = self.path / "references"
         return p if p.is_dir() else None
 
@@ -177,10 +176,10 @@ class SkillRegistry:
     eager_token_cap: int = 5000
 
     @classmethod
-    def scan(cls, roots: list[Path] | None = None) -> "SkillRegistry":
+    def scan(cls, roots: list[Path] | None = None) -> SkillRegistry:
         return cls(skills=discover_skills(roots))
 
-    def get(self, name: str) -> Optional[Skill]:
+    def get(self, name: str) -> Skill | None:
         for s in self.skills:
             if s.name == name:
                 return s

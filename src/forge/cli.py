@@ -15,11 +15,11 @@ Subcommands:
 """
 from __future__ import annotations
 
-import signal
 import shutil
+import signal
 import sys
+from datetime import UTC
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -30,14 +30,14 @@ from rich.table import Table
 
 from forge import __version__
 from forge.audit import AuditLog
-from forge.config import audit_log as audit_log_path, ensure_dirs
+from forge.config import audit_log as audit_log_path
+from forge.config import ensure_dirs
 from forge.gate import GateDecision
-from forge.permissions import Action, PermissionStore, actions_for_preview
+from forge.permissions import PermissionStore, actions_for_preview
 from forge.preview import Preview
 from forge.session import Session
 from forge.shadow import ShadowGit
 from forge.skills import SkillRegistry
-
 
 app = typer.Typer(
     name="forge",
@@ -142,7 +142,7 @@ def _run_session(
     preview: str,
     dry_run: bool = True,
     is_chat: bool = False,
-) -> "Session":
+) -> Session:
     """Build a Session for either `run` or `chat`. Honors --auto / --preview."""
     workspace = workspace.resolve()
     ensure_dirs(workspace)
@@ -339,8 +339,8 @@ def chat(
         ) as s:
             console.print(f"[dim]forge chat · {s.session_id} · {s.workspace}[/]")
             console.print(
-                f"[dim]Esc-Enter to submit · Enter for newline · "
-                f"Ctrl-D / /exit to quit · /undo /cost /reset /preview /skills[/]"
+                "[dim]Esc-Enter to submit · Enter for newline · "
+                "Ctrl-D / /exit to quit · /undo /cost /reset /preview /skills[/]"
             )
             prompt_session = make_session(
                 extra_completions=[s.name for s in s.skills.skills],
@@ -377,7 +377,7 @@ def chat(
                             console.print(f"[dim]preview mode: {arg}[/]")
                         else:
                             console.print(
-                                f"[red]usage: /preview <always|cells|never>[/]"
+                                "[red]usage: /preview <always|cells|never>[/]"
                             )
                         continue
                     if cmd == "/skills":
@@ -442,7 +442,7 @@ def chat(
         raise typer.Exit(1)
 
 
-def _run_turn_with_stream(s: "Session", user: str, *, no_stream: bool):
+def _run_turn_with_stream(s: Session, user: str, *, no_stream: bool):
     """Run a turn with optional token streaming to the TTY.
 
     Streaming uses a Rich Live region that updates token-by-token, then
@@ -485,7 +485,7 @@ def _run_turn_with_stream(s: "Session", user: str, *, no_stream: bool):
 def log_cmd(
     n: int = typer.Option(20, "-n", help="Number of recent entries to show."),
     full: bool = typer.Option(False, "--full", help="Don't truncate detail strings."),
-    session: Optional[str] = typer.Option(
+    session: str | None = typer.Option(
         None, "--session", help="Filter to a specific session id."
     ),
     workspace: Path = typer.Option(Path("."), "--cwd", "-C"),
@@ -602,7 +602,7 @@ def stats(
     import math as _math
     import time as _time
     from collections import Counter
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     audit = AuditLog(audit_log_path(workspace.resolve()))
     cutoff_ts = _time.time() - (days * 86400)
@@ -623,7 +623,7 @@ def stats(
         t_str = rec.get("t", "")
         try:
             t_clean = t_str.rstrip("Z").split(".")[0]
-            ts = datetime.fromisoformat(t_clean).replace(tzinfo=timezone.utc).timestamp()
+            ts = datetime.fromisoformat(t_clean).replace(tzinfo=UTC).timestamp()
         except (ValueError, TypeError):
             continue
         if ts < cutoff_ts:
@@ -753,8 +753,9 @@ def doctor(
     workspace: Path = typer.Option(Path("."), "--cwd", "-C"),
 ) -> None:
     """Verify Ollama is reachable, model is present, and the workspace is set up."""
-    import urllib.request
     import json as _json
+    import urllib.request
+
     from forge.config import DEFAULT_DRIVER_MODEL, DEFAULT_OLLAMA_URL, FORGE_HOME, SKILLS_HOME
 
     FORGE_HOME.mkdir(parents=True, exist_ok=True)
@@ -901,7 +902,11 @@ def skill_install(
 ) -> None:
     """Install a skill from a git repo, pinned to a specific sha."""
     from forge.installer import (
-        FloatingRefError, InstallError, execute_install, parse_spec, prepare_install,
+        FloatingRefError,
+        InstallError,
+        execute_install,
+        parse_spec,
+        prepare_install,
     )
 
     try:
@@ -1044,8 +1049,8 @@ def skill_search(
         table.add_row(r["full_name"], r["stars"], r["updated"], desc)
     console.print(table)
     console.print(
-        f"\n[dim]install one with:[/]\n"
-        f"  forge skill install <repo>@<sha>"
+        "\n[dim]install one with:[/]\n"
+        "  forge skill install <repo>@<sha>"
     )
 
 
@@ -1105,7 +1110,9 @@ def skill_update(
     # Recurse into `skill install` for the actual work — same flow.
     console.print()
     from forge.installer import (
-        SkillSpec, execute_install, prepare_install,
+        SkillSpec,
+        execute_install,
+        prepare_install,
     )
     spec = SkillSpec(
         url=f"https://github.com/{owner}/{repo}.git",
@@ -1147,9 +1154,15 @@ def daemon(
         task = "Write today's standup notes."
     """
     import os as _os
+
     from forge.daemon import (
-        Daemon, clear_pid, is_running, load_config, read_pid, write_pid,
-        _DAEMON_LOG_PATH, _DAEMON_PID_PATH,
+        _DAEMON_LOG_PATH,
+        Daemon,
+        clear_pid,
+        is_running,
+        load_config,
+        read_pid,
+        write_pid,
     )
 
     if status:

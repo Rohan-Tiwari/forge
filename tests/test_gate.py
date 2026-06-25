@@ -1,16 +1,12 @@
 """Tests for forge.gate — intent parser + AST lint + GateDecision."""
 from __future__ import annotations
 
-import pytest
-
 from forge.gate import (
     GateAction,
-    IntentBlock,
     analyze,
     check,
     parse_cell,
 )
-
 
 # =============================================================================
 # parse_cell

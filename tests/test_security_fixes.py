@@ -9,8 +9,6 @@ Covers:
 """
 from __future__ import annotations
 
-import json
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -30,7 +28,6 @@ from forge.sandbox import (
     _validate_workspace_path,
     build_profile,
 )
-
 
 # =============================================================================
 # Subprocess env scrubbing
@@ -257,10 +254,10 @@ class TestMCPHardening:
 class TestDryRunPathEscape:
     def test_absolute_path_write_blocked(self, tmp_path, monkeypatch):
         """A dry-run cell writing to /tmp/escape MUST NOT touch the real /tmp."""
+        import yaml
+
         from forge.gate import check
         from forge.preview import Preview
-
-        import yaml
         intent_yaml = yaml.safe_dump({
             "intent": "escape test",
             "writes": ["/tmp/forge_dryrun_escape_canary"],
@@ -293,10 +290,10 @@ class TestDryRunPathEscape:
 
     def test_relative_path_write_allowed(self, tmp_path):
         """Writes INSIDE the workspace should work normally."""
+        import yaml
+
         from forge.gate import check
         from forge.preview import Preview
-
-        import yaml
         intent_yaml = yaml.safe_dump({
             "intent": "inside workspace",
             "writes": ["./inside.txt"],

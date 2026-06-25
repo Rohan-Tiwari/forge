@@ -1,11 +1,9 @@
 """Tests for forge.cli — basic CliRunner coverage."""
 from __future__ import annotations
 
-import pytest
 from typer.testing import CliRunner
 
 from forge.cli import app
-
 
 runner = CliRunner()
 

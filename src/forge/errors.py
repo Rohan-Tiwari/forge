@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from abc import ABCMeta
 
-
 # =============================================================================
 # Root — uses ABCMeta so we can register virtual subclasses.
 # =============================================================================
@@ -141,6 +140,7 @@ class OllamaError(ProviderError):
 
 
 from forge.router import CostCeilingExceeded  # noqa: E402
+
 ForgeError.register(CostCeilingExceeded)
 ProviderError.register(CostCeilingExceeded)
 

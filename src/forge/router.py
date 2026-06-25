@@ -32,13 +32,12 @@ FORGE_DRIVER_MODEL.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
 
 from forge.config import (
     DEFAULT_DRIVER_MODEL,
     DEFAULT_NUM_CTX,
-    DEFAULT_OLLAMA_URL,
     DEFAULT_SESSION_COST_CEILING_USD,
 )
 from forge.providers import (
@@ -46,9 +45,7 @@ from forge.providers import (
     Provider,
     StreamChunk,
     default_providers,
-    price as _price,
 )
-
 
 __all__ = [
     "Completion",
@@ -167,8 +164,8 @@ class ModelRouter:
     def __init__(
         self,
         *,
-        roles: Optional[dict[str, RoleConfig]] = None,
-        providers: Optional[list[Provider]] = None,
+        roles: dict[str, RoleConfig] | None = None,
+        providers: list[Provider] | None = None,
         cost_ceiling_usd: float = DEFAULT_SESSION_COST_CEILING_USD,
     ):
         self.roles = roles or default_roles()
@@ -283,7 +280,7 @@ class ModelRouter:
 
         cfg = self.roles[role]
         attempt_models = self._attempt_models(role)
-        last_err: Optional[Exception] = None
+        last_err: Exception | None = None
 
         for model in attempt_models:
             provider = self._provider_for(model)
@@ -327,10 +324,10 @@ class ModelRouter:
 
         cfg = self.roles[role]
         attempt_models = self._attempt_models(role)
-        last_err: Optional[Exception] = None
+        last_err: Exception | None = None
 
         # Find a working provider+model first (no yields until we have one).
-        chosen_provider: Optional[Provider] = None
+        chosen_provider: Provider | None = None
         chosen_model = ""
         for model in attempt_models:
             provider = self._provider_for(model)
@@ -365,7 +362,7 @@ class ModelRouter:
             )
 
         # Forward chunks. Account on the final one.
-        final_completion: Optional[Completion] = None
+        final_completion: Completion | None = None
         try:
             for chunk in stream:
                 if chunk.is_final:

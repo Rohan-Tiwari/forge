@@ -16,11 +16,9 @@ import fnmatch
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
-
 
 # =============================================================================
 # Cell parsing — extract the intent fence and the python fence.
@@ -60,8 +58,8 @@ class IntentBlock(BaseModel):
 class ParsedCell:
     """The result of parsing a model response."""
 
-    intent: Optional[IntentBlock]
-    code: Optional[str]
+    intent: IntentBlock | None
+    code: str | None
     intent_first: bool = False
     parse_problems: list[str] = field(default_factory=list)
 
@@ -80,7 +78,7 @@ def parse_cell(text: str) -> ParsedCell:
         return ParsedCell(intent=None, code=None)  # prose-only — turn end
 
     problems: list[str] = []
-    intent: Optional[IntentBlock] = None
+    intent: IntentBlock | None = None
     intent_first = False
 
     if py_match is None:
@@ -132,7 +130,7 @@ _NET_QUALNAMES = {
 @dataclass
 class AstFindings:
     syntax_ok: bool
-    syntax_error: Optional[str] = None
+    syntax_error: str | None = None
     write_calls: list[tuple[str, str]] = field(default_factory=list)
     net_calls: list[tuple[str, str]] = field(default_factory=list)
     bash_calls: list[str] = field(default_factory=list)
@@ -153,7 +151,7 @@ def _qualname(node: ast.AST) -> str:
     return ".".join(reversed(parts))
 
 
-def _str_const(node: ast.AST) -> Optional[str]:
+def _str_const(node: ast.AST) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.JoinedStr):  # f-string
@@ -464,7 +462,7 @@ def _path_covers(declared: set[str], actual: str) -> bool:
 # =============================================================================
 
 
-class GateAction(str, Enum):
+class GateAction(str, Enum):  # noqa: UP042 — StrEnum requires py>=3.11; staying conservative
     ALLOW = "allow"
     CONFIRM = "confirm"
     DENY = "deny"
@@ -474,8 +472,8 @@ class GateAction(str, Enum):
 class GateDecision:
     action: GateAction
     reasons: list[str] = field(default_factory=list)
-    intent: Optional[IntentBlock] = None
-    findings: Optional[AstFindings] = None
+    intent: IntentBlock | None = None
+    findings: AstFindings | None = None
     parse_problems: list[str] = field(default_factory=list)
 
 

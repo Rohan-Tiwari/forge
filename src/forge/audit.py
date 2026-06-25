@@ -18,8 +18,9 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 try:
     import fcntl  # POSIX only

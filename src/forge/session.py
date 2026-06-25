@@ -25,22 +25,22 @@ Design rules followed here:
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
 
+from forge import tools
 from forge.audit import AuditLog, SessionLog, new_session_id
-from forge.config import audit_log as audit_log_path, ensure_dirs
+from forge.config import audit_log as audit_log_path
+from forge.config import ensure_dirs
 from forge.gate import GateAction, GateDecision, check, parse_cell
 from forge.kernel import Kernel, Observation
 from forge.mcp import MCPRegistry
-from forge.permissions import Action, PermissionStore, actions_for_preview
+from forge.permissions import PermissionStore, actions_for_preview
 from forge.preview import Preview
 from forge.router import Completion, ModelRouter
 from forge.shadow import ShadowGit
 from forge.skills import SkillRegistry
-from forge import tools
-
 
 SYSTEM_PROMPT_PATH = Path(__file__).parent / "system_prompt.md"
 
@@ -119,7 +119,7 @@ class Session:
 
     # ---- lifecycle ------------------------------------------------------
 
-    def __enter__(self) -> "Session":
+    def __enter__(self) -> Session:
         self.start()
         return self
 
@@ -222,7 +222,7 @@ class Session:
         self,
         user_msg: str,
         *,
-        on_chunk: Optional[ChunkCallback] = None,
+        on_chunk: ChunkCallback | None = None,
     ) -> TurnResult:
         """Run one user-turn worth of the perceive-plan-execute loop.
 
@@ -552,7 +552,7 @@ class Session:
 
     # ---- preview / confirm hooks ----------------------------------------
 
-    def _call_driver(self, on_chunk: Optional[ChunkCallback]) -> Completion:
+    def _call_driver(self, on_chunk: ChunkCallback | None) -> Completion:
         """Single driver-role completion. Streams via on_chunk if provided.
 
         Whether streaming or not, returns a fully-populated Completion. The
@@ -565,7 +565,7 @@ class Session:
             return self.router.complete(self._history, role="driver")
 
         # Streaming path — accumulate via complete_stream and forward deltas.
-        final: Optional[Completion] = None
+        final: Completion | None = None
         for chunk in self.router.complete_stream(self._history, role="driver"):
             if chunk.delta:
                 try:

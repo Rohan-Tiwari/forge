@@ -6,10 +6,8 @@ depending on any third-party MCP server being installed.
 """
 from __future__ import annotations
 
-import json
 import sys
 import textwrap
-from pathlib import Path
 
 import pytest
 
@@ -22,7 +20,6 @@ from forge.mcp import (
     MCPSession,
     load_config,
 )
-
 
 # =============================================================================
 # Tiny fake MCP server that speaks JSON-RPC 2.0 over stdio

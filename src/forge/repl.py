@@ -19,8 +19,8 @@ time, so non-chat commands stay snappy.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable, Optional
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
@@ -28,7 +28,6 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
-
 
 _HISTORY_PATH = Path.home() / ".forge" / "chat-history"
 
@@ -79,7 +78,7 @@ def _continuation_prompt(width, line_number, is_soft_wrap):
     return HTML(f'<continuation>{".":>{width - 1}} </continuation>')
 
 
-def make_session(*, history_path: Optional[Path] = None,
+def make_session(*, history_path: Path | None = None,
                  extra_completions: Iterable[str] = ()) -> PromptSession:
     """Build a PromptSession ready to drive `forge chat`.
 

@@ -22,8 +22,7 @@ variables.
 from __future__ import annotations
 
 import os
-from typing import Iterable
-
+from collections.abc import Iterable
 
 # The minimum set every subprocess needs to function:
 #   PATH        — exec to find binaries
