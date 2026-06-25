@@ -279,6 +279,41 @@ class Session:
                 self.log.write("turn.end.empty")
                 return result
 
+            # v0.2.2 — Ollama harmony parse recovery. The content we got is
+            # the model's raw output salvaged from a server-side tool-call
+            # parser crash; it's almost always a fragment (e.g. an import
+            # line), NOT the model's intended final reply. Never let it
+            # terminate the turn — force a retry with a stricter format
+            # reminder, counted against the parse-format budget.
+            if completion.finish_reason == "tool_call_parse_recovered":
+                if counters.parse_format < self.max_format_retries:
+                    counters.parse_format += 1
+                    self.log.write("recovery.tool_call_parse_retry",
+                                   attempt=counters.parse_format,
+                                   recovered_chars=len(completion.content))
+                    self.router.note_parse_format_fail("driver")
+                    self._history.append({
+                        "role": "user",
+                        "content": (
+                            "Reminder: your previous response was intercepted "
+                            "by Ollama's tool-call parser and only a fragment "
+                            "was recovered. Respond with a complete markdown "
+                            "message containing ```intent ...``` then ```py "
+                            "...``` fences. Do NOT emit bare Python statements "
+                            "or anything that looks like a tool call."
+                        ),
+                    })
+                    continue
+                # Out of retries — surface honestly rather than display the stub.
+                self.log.write("turn.end.tool_call_parse_unrecovered",
+                               recovered_chars=len(completion.content))
+                result.final_text = (
+                    f"(model output was intercepted by Ollama's tool-call "
+                    f"parser after {counters.parse_format} retries; only "
+                    f"a fragment was recovered)"
+                )
+                return result
+
             self._history.append({"role": "assistant", "content": completion.content})
 
             gate = check(completion.content)

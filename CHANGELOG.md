@@ -3,6 +3,34 @@
 All notable changes to Forge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.3] — 2026-06-25 — never display a parse-recovered fragment
+
+### Fixed
+
+- **Salvaged harmony fragments were leaking into the user reply.** v0.2.2's
+  wire-layer recovery path correctly extracted the model's raw output from
+  Ollama's harmony parse-error 500 — but the session loop then ran that
+  fragment through the same gate as a normal completion. When the fragment
+  happened to be a single import line (e.g. `import os, json, pathlib, sys`),
+  it parsed as "prose_only" and ended the turn, leaving the user staring at
+  a useless stub instead of the answer.
+
+  Now the session loop checks `finish_reason == "tool_call_parse_recovered"`
+  *before* the gate runs and forces a retry-with-format-reminder, counted
+  against the parse-format budget. If the budget is exhausted, the user sees
+  an honest "(model output was intercepted by Ollama's tool-call parser
+  after N retries)" message — never the salvaged fragment.
+
+  Belt-and-braces with the v0.2.2 wire fix: even if the harmony parser
+  fires, you get a clean retry instead of a broken UX.
+
+### Tests
+
+- 2 new tests in `test_session.py`: recovery → retry → real answer; and
+  the budget-exhaustion path returning an honest error instead of the
+  fragment. Fake router scripted-item format extended to accept
+  `(content, finish_reason)` tuples. Total: 425 tests passing.
+
 ## [0.2.2] — 2026-06-25 — Ollama harmony tool-call wire fix
 
 ### Fixed

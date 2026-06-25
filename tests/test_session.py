@@ -33,9 +33,15 @@ class FakeRouter:
 
     def complete(self, messages, *, role="driver", max_tokens=2048):
         try:
-            content = next(self._iter)
+            item = next(self._iter)
         except StopIteration:
-            content = "(out of scripted completions)"
+            item = "(out of scripted completions)"
+        # Scripted items can be plain strings (default finish_reason="stop")
+        # or (content, finish_reason) tuples for testing recovery paths.
+        if isinstance(item, tuple):
+            content, finish_reason = item
+        else:
+            content, finish_reason = item, "stop"
         c = Completion(
             content=content,
             role_used=role,
@@ -44,7 +50,7 @@ class FakeRouter:
             prompt_tokens=10,
             completion_tokens=20,
             cost_usd=0.0,
-            finish_reason="stop",
+            finish_reason=finish_reason,
         )
         self.calls.append(c)
         return c
@@ -143,6 +149,45 @@ def test_empty_content_retries_once(session, tmp_path):
     result = session.turn("what?")
     assert result.cells_run == 1
     assert "42" in result.final_text
+
+
+def test_tool_call_parse_recovered_retries_not_displayed(session, tmp_path):
+    """v0.2.3 — a tool_call_parse_recovered Completion is a salvaged fragment
+    from an Ollama harmony parser crash, never the model's intended final
+    reply. It must trigger a retry, never terminate the turn.
+    """
+    _patch_router(session, [
+        # First call: harmony crashes, only "import os" is recovered. Looks
+        # like prose to the gate but came from a parse-error 500.
+        ("import os, json", "tool_call_parse_recovered"),
+        # Retry — now the model produces a proper cell.
+        _wrap('print(42)'),
+        # Final prose
+        "Answered: 42.",
+    ])
+    result = session.turn("count things")
+    assert result.cells_run == 1
+    assert "42" in result.final_text
+    # The recovered stub must NOT appear in the final user-facing reply
+    assert "import os" not in result.final_text
+
+
+def test_tool_call_parse_recovered_exhaust_retries_honest_error(session, tmp_path):
+    """If the harmony parser keeps firing past the retry budget, surface a
+    clear error to the user — do NOT display the recovered fragment as if
+    it were a real reply.
+    """
+    _patch_router(session, [
+        ("import os", "tool_call_parse_recovered"),
+        ("import json", "tool_call_parse_recovered"),
+        ("import sys", "tool_call_parse_recovered"),
+        ("import pathlib", "tool_call_parse_recovered"),
+    ])
+    result = session.turn("count things")
+    # Final reply tells the user honestly, doesn't display the import line
+    assert "intercepted" in result.final_text.lower()
+    assert "import os" not in result.final_text
+    assert "import pathlib" not in result.final_text
 
 
 def test_format_failure_retries(session, tmp_path):
