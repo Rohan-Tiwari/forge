@@ -467,6 +467,12 @@ class Session:
             "execute. A flat refusal defeats the purpose of plan mode; "
             "instead, write a plan with Risk: critical markers and put your "
             "objections under Open questions.\n\n"
+            "PRINCIPLE: prefer minimal one-shot solutions. For read-only "
+            "questions ('how many X', 'list Y', 'what files...') a single "
+            "shell pipeline or one-line Python is usually right. Don't "
+            "propose a new helper script unless persistence/reuse is "
+            "explicitly required. Steps you'd skip in your own work should "
+            "be marked 'informational' rather than 'required'.\n\n"
             "Response format (no code fences, no intent blocks):\n\n"
             "## Goal\n"
             "(restate the user's task in one sentence)\n\n"
@@ -474,7 +480,8 @@ class Session:
             "Numbered list. For each step:\n"
             "- What you'd do\n"
             "- Why\n"
-            "- Risk: low / medium / high / critical\n\n"
+            "- Risk: low / medium / high / critical\n"
+            "- (Optional) Required: yes / informational\n\n"
             "## Files touched\n"
             "(or 'none')\n\n"
             "## Network calls\n"
@@ -484,7 +491,7 @@ class Session:
             "execute this plan (still include the plan itself above so the "
             "user can review). Use this section to surface ethical / safety "
             "concerns rather than refusing the whole response.\n\n"
-            "Keep it under 600 words. Be specific."
+            "Keep it under 600 words. Be specific. Don't pad."
         )
         messages = [
             {"role": "system", "content": plan_system},

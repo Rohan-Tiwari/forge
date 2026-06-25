@@ -512,14 +512,17 @@ def diff_installed(name: str) -> str:
 # =============================================================================
 
 
-def search_skills(query: str, *, limit: int = 10) -> list[dict[str, str]]:
+def search_skills(query: str, *, limit: int = 10) -> dict[str, Any]:
     """Search GitHub for repos with the `forge-skill` topic.
 
-    Returns a list of {name, owner, full_name, description, stars, url, updated}
-    dicts. Skips silently on network errors — search is a convenience, never
-    a blocker.
+    Returns a dict:
+        {
+            "results": [{name, owner, full_name, description, stars, url, updated}, ...],
+            "rate_limited": bool,
+            "rate_limit_remaining": int | None,
+        }
 
-    No GitHub auth required for this endpoint (60 req/hr unauthenticated).
+    No GitHub auth required for unauthenticated 60 req/hr.
     Users behind corporate proxies who hit rate limits can set GITHUB_TOKEN
     to upgrade to 5000/hr.
     """
@@ -549,8 +552,27 @@ def search_skills(query: str, *, limit: int = 10) -> list[dict[str, str]]:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.load(resp)
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
-        return []
+            headers = dict(resp.getheaders())
+    except urllib.error.HTTPError as e:
+        # 403/429 with rate-limit headers means we're throttled, not "no results"
+        try:
+            hdrs = dict(e.headers or {})
+            remaining_str = hdrs.get("X-RateLimit-Remaining", "")
+            remaining = int(remaining_str) if remaining_str.isdigit() else None
+            return {
+                "results": [],
+                "rate_limited": e.code in (403, 429) and remaining == 0,
+                "rate_limit_remaining": remaining,
+            }
+        except (AttributeError, ValueError):
+            return {"results": [], "rate_limited": False,
+                    "rate_limit_remaining": None}
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return {"results": [], "rate_limited": False,
+                "rate_limit_remaining": None}
+
+    remaining_str = headers.get("X-RateLimit-Remaining", "")
+    remaining = int(remaining_str) if remaining_str.isdigit() else None
 
     results: list[dict[str, str]] = []
     for item in (data.get("items") or [])[:limit]:
@@ -564,7 +586,11 @@ def search_skills(query: str, *, limit: int = 10) -> list[dict[str, str]]:
             "updated": str(item.get("updated_at", ""))[:10],
             "default_branch": str(item.get("default_branch") or "main"),
         })
-    return results
+    return {
+        "results": results,
+        "rate_limited": False,
+        "rate_limit_remaining": remaining,
+    }
 
 
 def latest_sha(owner: str, repo: str, ref: str = "HEAD") -> Optional[str]:

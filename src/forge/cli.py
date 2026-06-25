@@ -122,6 +122,11 @@ def _root(
         False, "--version", "-V", is_eager=True, help="Show version and exit."
     ),
 ) -> None:
+    # Configure logging once for any subcommand. Honors FORGE_LOG_LEVEL.
+    from forge.log import is_configured, setup_logging
+    if not is_configured():
+        setup_logging()
+
     if version:
         console.print(f"forge {__version__}")
         raise typer.Exit()
@@ -170,13 +175,20 @@ def plan(
     workspace: Path = typer.Option(Path("."), "--cwd", "-C"),
     debug: bool = typer.Option(False, "--debug"),
 ) -> None:
-    """Get a markdown plan for a task — no cells execute, no files change.
+    """Get a markdown plan for a task — no cells execute, no user files change.
+
+    A `.forge/` workspace dir IS created on first use to hold the audit log
+    and shadow-git checkpoint repo (used only if you later run forge run
+    in this workspace). User content is never modified by plan mode.
 
     Uses the `planner` role (defaults to gpt-oss at high effort; auto-escalates
     to Claude or GPT if their API key is set). Returns a structured plan with
     goal, steps with risk levels, files touched, network calls, open questions.
 
     Use this before running risky tasks to review what the agent intends to do.
+    Even for tasks the planner would refuse to execute, plan mode emits a
+    structured 'decline plan' with critical-risk markers, so review remains
+    actionable.
     """
     try:
         with _run_session(
@@ -223,6 +235,11 @@ def run(
         False, "--no-dry-run",
         help="Skip dry-run overlay execution; use static AST analysis only for previews.",
     ),
+    show_stdout: bool = typer.Option(
+        False, "--show-stdout",
+        help="Append the last cell's stdout to the reply panel (useful in --auto when "
+             "the model's prose mentions output but doesn't include it verbatim).",
+    ),
     debug: bool = typer.Option(False, "--debug", help="Show full tracebacks on errors."),
 ) -> None:
     """Run the agent on one task and exit."""
@@ -266,8 +283,22 @@ def run(
                     f"cost ${result.cost_usd:.4f}[/]"
                 )
             if result.final_text:
+                reply_body = result.final_text
+                if show_stdout and result.observations:
+                    last_stdout = (result.observations[-1].stdout or "").rstrip()
+                    if last_stdout:
+                        # Truncate aggressively — the panel is meant for a digest.
+                        if len(last_stdout) > 2000:
+                            last_stdout = (
+                                last_stdout[:2000]
+                                + f"\n... [+{len(result.observations[-1].stdout) - 2000} more chars]"
+                            )
+                        reply_body = (
+                            f"{result.final_text}\n\n"
+                            f"[dim]── last cell stdout ──[/]\n{last_stdout}"
+                        )
                 console.print(Panel(
-                    result.final_text,
+                    reply_body,
                     title="reply",
                     border_style="green",
                 ))
@@ -979,13 +1010,27 @@ def skill_search(
     from forge.installer import search_skills
 
     console.print(f"[dim]searching github for skills{f' matching {query!r}' if query else ''}…[/]")
-    results = search_skills(query, limit=limit)
+    response = search_skills(query, limit=limit)
+    results = response["results"]
     if not results:
-        console.print(
-            "[yellow]no skills found.[/]\n"
-            "[dim]Either nothing matches, or GitHub rate-limited us — "
-            "try `export GITHUB_TOKEN=...` and retry.[/]"
-        )
+        if response["rate_limited"]:
+            console.print(
+                "[yellow]GitHub rate-limited the search request.[/]\n"
+                "[dim]Set GITHUB_TOKEN (https://github.com/settings/tokens) "
+                "and retry — that raises the limit from 60/hr to 5000/hr.[/]"
+            )
+        else:
+            remaining = response["rate_limit_remaining"]
+            remaining_hint = (
+                f" ({remaining} req remaining in this hour)"
+                if remaining is not None else ""
+            )
+            console.print(
+                f"[yellow]no skills match.[/]{remaining_hint}\n"
+                "[dim]Forge skills are GitHub repos tagged with the "
+                "`forge-skill` topic. Try `forge skill search` (no query) "
+                "to list all of them.[/]"
+            )
         return
     table = Table(show_header=True, header_style="bold")
     table.add_column("repo")

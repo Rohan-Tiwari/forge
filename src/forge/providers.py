@@ -132,41 +132,99 @@ def _load_pricing_override() -> dict[str, tuple[float, float]]:
         [pricing."my-custom-model"]
         input = 0.0
         output = 0.0
+
+    Malformed per-model entries are skipped with a logged warning so
+    users editing the file by hand can find typos.
     """
+    import logging
     import tomllib
     from pathlib import Path
 
+    log = logging.getLogger(__name__)
     path = Path.home() / ".forge" / "pricing.toml"
     if not path.exists():
         return {}
     try:
         with path.open("rb") as f:
             data = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError):
+    except OSError as e:
+        log.warning("could not read %s: %s", path, e)
+        return {}
+    except tomllib.TOMLDecodeError as e:
+        log.warning("malformed TOML in %s: %s — using baseline pricing", path, e)
         return {}
     out: dict[str, tuple[float, float]] = {}
     for model, entry in (data.get("pricing") or {}).items():
         if not isinstance(entry, dict):
+            log.warning(
+                "pricing override entry for %r is not a table — skipping", model,
+            )
             continue
         try:
             inp = float(entry.get("input", 0))
             outp = float(entry.get("output", 0))
             out[str(model)] = (inp, outp)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as e:
+            log.warning(
+                "pricing override for %r has invalid input/output (%s) — skipping",
+                model, e,
+            )
             continue
     return out
 
 
-# Cached at module load. Override doesn't change at runtime; if the user
-# edits the file they reload the process — that's the expected workflow.
+# Cached at module load. Override doesn't change at runtime unless price()
+# detects an mtime change (see below), or callers explicitly invoke
+# reload_pricing().
 _PRICING_OVERRIDE: dict[str, tuple[float, float]] = _load_pricing_override()
+_PRICING_OVERRIDE_MTIME: float = 0.0
 
 
-# Combined view: override wins over baseline. Public for inspection / tests.
+def _pricing_path() -> "Path":
+    from pathlib import Path
+    return Path.home() / ".forge" / "pricing.toml"
+
+
+# Initialize the mtime cache. price() checks this on every call and reloads
+# if the file changed — cheap (one stat), correct (hot-reload), and avoids
+# the "daemon serves stale prices" footgun.
+try:
+    _PRICING_OVERRIDE_MTIME = _pricing_path().stat().st_mtime
+except OSError:
+    pass
+
+
+# Combined view: override wins over baseline. NOTE: this dict is inspection-
+# only and lags hot-reloads — `price()` consults _PRICING_OVERRIDE and
+# _PRICING_BASELINE directly to keep precedence ordering explicit. Don't
+# refactor price() to read _PRICING.
 _PRICING: dict[str, tuple[float, float]] = {
     **_PRICING_BASELINE,
     **_PRICING_OVERRIDE,
 }
+
+
+def _maybe_reload_pricing() -> None:
+    """If ~/.forge/pricing.toml mtime changed, re-read it.
+
+    Called from price() on every invocation. Cost: one stat() per price()
+    call — negligible. Benefit: daemons + long-lived REPL sessions pick
+    up pricing edits without restart.
+    """
+    global _PRICING_OVERRIDE_MTIME, _PRICING_OVERRIDE, _PRICING
+    try:
+        mtime = _pricing_path().stat().st_mtime
+    except OSError:
+        # File deleted since last check — clear the override.
+        if _PRICING_OVERRIDE:
+            _PRICING_OVERRIDE = {}
+            _PRICING_OVERRIDE_MTIME = 0.0
+            _PRICING = dict(_PRICING_BASELINE)
+        return
+    if mtime != _PRICING_OVERRIDE_MTIME:
+        _PRICING_OVERRIDE = _load_pricing_override()
+        _PRICING = {**_PRICING_BASELINE, **_PRICING_OVERRIDE}
+        _PRICING_OVERRIDE_MTIME = mtime
 
 
 def price(model: str, p_in: int, p_out: int) -> float:
@@ -175,7 +233,11 @@ def price(model: str, p_in: int, p_out: int) -> float:
     Override layer is consulted first — useful for users on custom pricing
     (enterprise discounts, self-hosted models with electricity costs, etc).
     Falls back to the baseline. Unknown models return 0 rather than crash.
+
+    Auto-reloads ~/.forge/pricing.toml if its mtime has changed since the
+    last call — daemons and long-lived REPLs stay current without restart.
     """
+    _maybe_reload_pricing()
     if model in _PRICING_OVERRIDE:
         in_cost, out_cost = _PRICING_OVERRIDE[model]
     else:
@@ -184,10 +246,14 @@ def price(model: str, p_in: int, p_out: int) -> float:
 
 
 def reload_pricing() -> dict[str, tuple[float, float]]:
-    """Re-read ~/.forge/pricing.toml. Useful for tests + interactive REPL."""
-    global _PRICING_OVERRIDE, _PRICING
+    """Force a re-read of ~/.forge/pricing.toml. Useful for tests + explicit refresh."""
+    global _PRICING_OVERRIDE, _PRICING, _PRICING_OVERRIDE_MTIME
     _PRICING_OVERRIDE = _load_pricing_override()
     _PRICING = {**_PRICING_BASELINE, **_PRICING_OVERRIDE}
+    try:
+        _PRICING_OVERRIDE_MTIME = _pricing_path().stat().st_mtime
+    except OSError:
+        _PRICING_OVERRIDE_MTIME = 0.0
     return dict(_PRICING)
 
 
