@@ -412,11 +412,34 @@ def _copy_workspace(src: Path, dst: Path) -> None:
 
 # Driver that runs in a fresh subprocess, isolated from any forge state.
 # Replaces Bash/subprocess/network with no-ops so dry-run is filesystem-only.
+#
+# SECURITY: also wraps Write/Edit/open to ensure all writes happen INSIDE
+# the overlay tmpdir. Without this, a cell calling Write("/abs/path") OR
+# Write("~/sensitive") OR Write("../escape") would touch the real
+# filesystem. See v0.2.1 audit finding #4.
 _DRY_RUN_DRIVER = r'''
 import sys, json, traceback, contextlib, io, os
+from pathlib import Path
 
 # Read the cell code from FORGE_DRY_RUN_CODE env var.
 code = os.environ.get("FORGE_DRY_RUN_CODE", "")
+OVERLAY = os.path.realpath(os.getcwd())
+
+def _path_inside_overlay(target):
+    """Return absolute resolved path IF inside overlay, else raise."""
+    if hasattr(target, "__fspath__"):
+        target = os.fspath(target)
+    target = os.path.expanduser(str(target))
+    abs_path = os.path.realpath(target) if os.path.isabs(target) else os.path.realpath(
+        os.path.join(OVERLAY, target)
+    )
+    overlay_real = OVERLAY
+    if abs_path != overlay_real and not abs_path.startswith(overlay_real + os.sep):
+        raise PermissionError(
+            f"dry-run write escape blocked: {target!r} resolves to "
+            f"{abs_path!r}, outside overlay {overlay_real!r}"
+        )
+    return abs_path
 
 # Stub side-effecting functions so dry-run doesn't fire real network/shell.
 class _StubBashResult:
@@ -432,31 +455,44 @@ def find_skill(*a, **kw): return []
 def run_skill(*a, **kw): return None
 def call_mcp(*a, **kw): return None
 
-# Real Read/Write/Edit happen against the overlay cwd — that's the whole point.
-# Use forge.tools' implementations (paths get protected-path-checked but that's
-# desirable — same safety story applies in dry-run).
+# Real Read/Write/Edit happen against the overlay cwd — that's the whole
+# point. We import forge.tools' implementations but WRAP them so any path
+# that escapes the overlay raises BEFORE the underlying tool sees it.
 sys.path.insert(0, os.environ.get("FORGE_SRC_PATH", ""))
 try:
-    from forge.tools import Read, Write, Edit
-except Exception:
-    # Fallback to stdlib equivalents if forge isn't on path
-    def Read(p):
-        with open(p) as f: return f.read()
-    def Write(p, c):
-        os.makedirs(os.path.dirname(os.path.abspath(p)) or ".", exist_ok=True)
-        with open(p, "w") as f: f.write(c)
-    def Edit(p, old, new, *, replace_all=False):
-        with open(p) as f: t = f.read()
-        if replace_all: t2 = t.replace(old, new)
-        else: t2 = t.replace(old, new, 1)
-        with open(p, "w") as f: f.write(t2)
+    from forge.tools import Read as _real_Read, Write as _real_Write, Edit as _real_Edit
 
-# Block real network at the SDK level — the dry-run is FS-only.
+    def Read(path, **kw):
+        _path_inside_overlay(path)
+        return _real_Read(path, **kw)
+
+    def Write(path, content):
+        _path_inside_overlay(path)
+        return _real_Write(path, content)
+
+    def Edit(path, old, new, **kw):
+        _path_inside_overlay(path)
+        return _real_Edit(path, old, new, **kw)
+except Exception:
+    # SECURITY: fail closed. If forge.tools can't import, we DO NOT
+    # silently fall back to a permissive stdlib Write — that was the
+    # previous behavior and it defeated the safety story. Surface the
+    # import error so the dry-run is honestly broken rather than a
+    # false-positive "clean" preview.
+    raise
+
+# Block real network at the SDK level — the dry-run is FS-only. Also
+# block socket directly so libs that bypass urllib still get caught.
 class _NetBlocked(Exception): pass
 def _no_network(*a, **kw): raise _NetBlocked("dry-run: network skipped")
 try:
     import urllib.request
     urllib.request.urlopen = _no_network
+except ImportError: pass
+try:
+    import socket
+    socket.socket = _no_network  # type: ignore[assignment]
+    socket.create_connection = _no_network  # type: ignore[assignment]
 except ImportError: pass
 
 GLOBALS = {
@@ -473,6 +509,9 @@ try:
         exec(compile(code, "<dry-run>", "exec"), GLOBALS)
 except _NetBlocked as e:
     err = f"network blocked (expected for dry-run): {e}"
+except PermissionError as e:
+    ok = False
+    err = f"PermissionError: {e}"
 except BaseException as e:
     ok = False
     err = f"{type(e).__name__}: {e}"
@@ -486,12 +525,18 @@ def _run_cell_in_overlay(
 ) -> tuple[bool, str]:
     """Run `code` in a fresh subprocess with cwd=overlay. Returns (ok, error)."""
     import sys as _sys
-    env = os.environ.copy()
-    env["FORGE_DRY_RUN_CODE"] = code
-    # Make forge.tools importable for protected-path checks during dry-run
+
+    # SECURITY: minimal env for the dry-run subprocess too. Same reasoning
+    # as kernel.py: agent-emitted code in the dry-run can still call
+    # os.environ.get('...') and exfiltrate via the FS overlay (which the
+    # user then sees in the preview).
+    from forge._subprocess_env import build_minimal_env
     forge_src = str(Path(__file__).resolve().parent.parent)
-    env["FORGE_SRC_PATH"] = forge_src
-    env["PYTHONUNBUFFERED"] = "1"
+    env = build_minimal_env(extra={
+        "FORGE_DRY_RUN_CODE": code,
+        "FORGE_SRC_PATH": forge_src,
+        "PYTHONUNBUFFERED": "1",
+    })
 
     try:
         proc = subprocess.run(  # noqa: S603

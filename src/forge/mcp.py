@@ -167,8 +167,16 @@ class MCPSession:
                 )
             cmd = resolved
 
-        env = os.environ.copy()
-        env.update(self.config.env)
+        # SECURITY: build a MINIMAL env for the MCP server rather than
+        # inheriting the parent's. This prevents provider secrets from leaking
+        # to npm-installed servers (which run as `npx` and could have
+        # compromised dependencies). The server gets ONLY:
+        #   - the default allowlist (PATH, HOME, etc.)
+        #   - the explicit env from the server's config block
+        # Provider creds (ANTHROPIC_API_KEY, OPENAI_API_KEY, GITHUB_TOKEN
+        # unless explicitly listed) stay in the parent.
+        from forge._subprocess_env import build_minimal_env
+        env = build_minimal_env(extra=dict(self.config.env))
 
         self.proc = subprocess.Popen(  # noqa: S603
             [cmd, *self.config.args],
@@ -273,12 +281,21 @@ class MCPSession:
 
         Notifications and out-of-order results are discarded for v0; a future
         version will route them properly to support async server-side events.
+
+        SECURITY: bounded line read + broad except.
+        - A hostile/buggy server emitting a single huge line without \\n
+          would drive the parent OOM via unbounded readline. We cap at 1 MB.
+        - Deeply nested JSON (`{"a":{"a":{...}}}` past sys.getrecursionlimit)
+          raises RecursionError (a RuntimeError, NOT JSONDecodeError) which
+          would escape the loop and unwind into the Session. Catch it.
+        See v0.2.1 audit finding #3.
         """
         if self.proc is None or self.proc.stdout is None:
             raise MCPError(f"MCP {self.config.name}: not started")
+        MAX_LINE_BYTES = 1_000_000  # 1 MB ceiling per JSON-RPC frame
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            line = self.proc.stdout.readline()
+            line = self.proc.stdout.readline(MAX_LINE_BYTES)
             if not line:
                 # Server died.
                 err = "".join(self._stderr_buf[-20:])
@@ -286,9 +303,18 @@ class MCPSession:
                     f"MCP {self.config.name}: server closed stdout. "
                     f"recent stderr:\n{err}"
                 )
+            # If we hit the line cap without seeing \n, the server is
+            # producing pathological output — kill the session.
+            if len(line) >= MAX_LINE_BYTES and not line.endswith("\n"):
+                raise MCPError(
+                    f"MCP {self.config.name}: server emitted a >{MAX_LINE_BYTES} "
+                    f"byte line without newline — aborting (likely malformed "
+                    f"or hostile)."
+                )
             try:
                 msg = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError, ValueError):
+                # Bad JSON or pathologically nested — log and skip.
                 continue
             # Notifications have no id; skip for now.
             if "id" not in msg:

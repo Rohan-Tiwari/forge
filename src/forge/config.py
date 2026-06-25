@@ -1,5 +1,15 @@
 """Configuration constants and paths.
 
+Three layers, in priority order:
+  1. ENV VARS — FORGE_HOME, FORGE_OLLAMA_URL, FORGE_DRIVER_MODEL, etc.
+     Always win. Useful for CI / per-shell overrides.
+  2. ~/.forge/config.toml — user-level defaults.
+  3. Hardcoded defaults below.
+
+The TOML file is OPTIONAL. Forge runs fine without it; values fall through
+to the hardcoded defaults. Per-domain config files (mcp.toml, daemon.toml,
+pricing.toml, permissions.toml) stay separate.
+
 Keep this module free of project-internal imports — it's the foundation
 everyone else depends on.
 """
@@ -7,6 +17,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 # -----------------------------------------------------------------------------
 # Paths the agent uses on disk. Everything is under ~/.forge/ or the workspace.
@@ -15,6 +26,60 @@ from pathlib import Path
 HOME = Path.home()
 FORGE_HOME = Path(os.environ.get("FORGE_HOME", HOME / ".forge")).expanduser()
 SKILLS_HOME = Path(os.environ.get("FORGE_SKILLS", HOME / ".skills")).expanduser()
+CONFIG_PATH = FORGE_HOME / "config.toml"
+
+
+def _load_config() -> dict[str, Any]:
+    """Read ~/.forge/config.toml. Returns {} if absent or unparseable.
+
+    Logs a warning on parse errors. Does NOT crash — forge always must boot.
+
+    Schema (all keys optional):
+
+        [defaults]
+        ollama_url = "http://localhost:11434/v1"
+        driver_model = "gpt-oss:20b"
+        num_ctx = 16384
+        keep_alive = "24h"
+        cost_ceiling_usd = 5.0
+        log_level = "WARNING"        # DEBUG / INFO / WARNING / ERROR
+        log_file = "~/.forge/forge.log"
+    """
+    import logging
+    log = logging.getLogger(__name__)
+
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        import tomllib
+        with CONFIG_PATH.open("rb") as f:
+            return tomllib.load(f)
+    except OSError as e:
+        log.warning("could not read %s: %s", CONFIG_PATH, e)
+        return {}
+    except Exception as e:  # noqa: BLE001 — tomllib raises TOMLDecodeError
+        log.warning("malformed %s: %s — using hardcoded defaults", CONFIG_PATH, e)
+        return {}
+
+
+_CONFIG = _load_config()
+
+
+def _resolve(env_var: str, *, key: str, default: Any, cast: Any = str) -> Any:
+    """Resolve env var → config.toml key → hardcoded default."""
+    raw = os.environ.get(env_var)
+    if raw is not None:
+        try:
+            return cast(raw)
+        except (TypeError, ValueError):
+            return default
+    defaults = _CONFIG.get("defaults") or {}
+    if key in defaults:
+        try:
+            return cast(defaults[key])
+        except (TypeError, ValueError):
+            return default
+    return default
 
 
 def workspace_dir(workspace: Path) -> Path:
@@ -149,14 +214,28 @@ PROTECTED_ACTIONS: tuple[str, ...] = (
 
 # -----------------------------------------------------------------------------
 # Defaults
+# Resolution order: env var → ~/.forge/config.toml [defaults] → hardcoded.
 # -----------------------------------------------------------------------------
 
-DEFAULT_OLLAMA_URL = os.environ.get("FORGE_OLLAMA_URL", "http://localhost:11434/v1")
-DEFAULT_DRIVER_MODEL = os.environ.get("FORGE_DRIVER_MODEL", "gpt-oss:20b")
-DEFAULT_NUM_CTX = int(os.environ.get("FORGE_NUM_CTX", "16384"))
-DEFAULT_KEEP_ALIVE = os.environ.get("FORGE_KEEP_ALIVE", "24h")
-DEFAULT_SESSION_COST_CEILING_USD = float(
-    os.environ.get("FORGE_COST_CEILING_USD", "5.00")
+DEFAULT_OLLAMA_URL = _resolve(
+    "FORGE_OLLAMA_URL", key="ollama_url",
+    default="http://localhost:11434/v1",
+)
+DEFAULT_DRIVER_MODEL = _resolve(
+    "FORGE_DRIVER_MODEL", key="driver_model",
+    default="gpt-oss:20b",
+)
+DEFAULT_NUM_CTX = _resolve(
+    "FORGE_NUM_CTX", key="num_ctx",
+    default=16384, cast=int,
+)
+DEFAULT_KEEP_ALIVE = _resolve(
+    "FORGE_KEEP_ALIVE", key="keep_alive",
+    default="24h",
+)
+DEFAULT_SESSION_COST_CEILING_USD = _resolve(
+    "FORGE_COST_CEILING_USD", key="cost_ceiling_usd",
+    default=5.00, cast=float,
 )
 
 

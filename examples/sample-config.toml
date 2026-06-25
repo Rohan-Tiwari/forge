@@ -1,0 +1,32 @@
+# Sample ~/.forge/config.toml
+#
+# All keys are OPTIONAL. Forge runs fine without this file — values fall
+# through to hardcoded defaults. Env vars (FORGE_*) always override these.
+#
+# Copy this to ~/.forge/config.toml and edit to taste.
+
+[defaults]
+
+# The base URL of your Ollama instance. Default is the standard localhost.
+ollama_url = "http://localhost:11434/v1"
+
+# The model the agent's driver role uses. Anything pulled in Ollama works.
+driver_model = "gpt-oss:20b"
+
+# Context window size in tokens. Larger = more conversation memory but
+# slower + more RAM. The model's actual cap is the upper bound.
+num_ctx = 16384
+
+# How long Ollama keeps the model in memory between requests.
+# "24h" = stays warm for a day. "0" = unload immediately after each call.
+# "-1" = pin in memory until Ollama restarts.
+keep_alive = "24h"
+
+# Hard cap per session — agent refuses to keep calling once we cross this
+# in USD. Local-only sessions are $0 so the ceiling is just a safety rail
+# for when ANTHROPIC_API_KEY / OPENAI_API_KEY are set.
+cost_ceiling_usd = 5.00
+
+# Optional logging — see forge.log module. Honors FORGE_LOG_LEVEL env var.
+# log_level = "WARNING"
+# log_file = "~/.forge/forge.log"

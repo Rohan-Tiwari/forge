@@ -100,12 +100,41 @@ _BASE_PROFILE = r"""(version 1)
 """
 
 
+class WorkspaceUnrepresentableError(RuntimeError):
+    """Workspace path contains characters that can't be safely interpolated
+    into a sandbox-exec profile.
+
+    Sandbox-exec's TinyScheme uses double-quoted strings with backslash
+    escaping; embedded newlines, unescaped quotes, parens, or backslashes
+    break out of the string literal and could allow profile injection.
+    Rather than escape (which is fragile across grammar variants), we
+    refuse paths that contain any of these characters.
+    """
+
+
+_FORBIDDEN_PATH_CHARS = set('\n\r\\"()')
+
+
+def _validate_workspace_path(workspace: Path) -> str:
+    """Return realpath as a string IF safe to interpolate; else raise."""
+    real = os.path.realpath(workspace)
+    bad = _FORBIDDEN_PATH_CHARS & set(real)
+    if bad:
+        raise WorkspaceUnrepresentableError(
+            f"workspace path contains characters that can't be safely "
+            f"interpolated into a sandbox-exec profile: "
+            f"{sorted(c.encode().hex() for c in bad)}. "
+            f"Rename the directory."
+        )
+    return real
+
+
 def _make_write_rules(workspace: Path) -> str:
     """Build (allow file-write*) clauses for the paths we DO want writable."""
-    workspace_real = os.path.realpath(workspace)
-    forge_home = os.path.realpath(os.path.expanduser("~/.forge"))
-    skills_home = os.path.realpath(os.path.expanduser("~/.skills"))
-    tmpdir = os.path.realpath(tempfile.gettempdir())
+    workspace_real = _validate_workspace_path(workspace)
+    forge_home = _validate_workspace_path(Path(os.path.expanduser("~/.forge")))
+    skills_home = _validate_workspace_path(Path(os.path.expanduser("~/.skills")))
+    tmpdir = _validate_workspace_path(Path(tempfile.gettempdir()))
 
     rules: list[str] = []
 
@@ -137,24 +166,43 @@ def _make_write_rules(workspace: Path) -> str:
 
 
 def _make_network_rules(allowed_hosts: list[str]) -> str:
-    """Build (allow network-outbound) clauses for the allowlist."""
+    """Build (allow network-outbound) clauses for the allowlist.
+
+    SECURITY NOTE: sandbox-exec's TinyScheme DOES NOT support hostname
+    filtering. We can only allow/deny by IP, port, or local-vs-remote. So:
+
+    - Localhost is always allowed (set in _BASE_PROFILE — covers Ollama).
+    - For anything else, sandbox-exec literally CANNOT enforce a per-host
+      rule. The previous implementation responded to a non-empty
+      allowlist by emitting a bare `(allow network-outbound)`, which is
+      EQUIVALENT TO NO NETWORK SANDBOX AT ALL. That was a silent no-op
+      that defeated the safety story.
+
+    The current behavior:
+    - allowed_hosts is treated as informational only. We emit a comment
+      noting what was requested.
+    - We DO NOT emit any catch-all `(allow network-outbound)`. Outbound
+      stays denied unless the caller is willing to live without
+      sandbox-exec's network rule entirely, in which case they should
+      run with FORGE_DISABLE_SANDBOX=1 (and audit-log a warning).
+
+    Future work (v0.3): route through a localhost HTTP proxy that
+    enforces hostname filtering and pass `(allow network-bind localhost
+    + outbound to proxy)` only. That's the actually-correct architecture.
+    """
     rules: list[str] = []
-    # Localhost is already permitted via the localhost rule; don't repeat.
-    # Each allowed host gets a regex-style match.
     for host in allowed_hosts:
-        # Match against remote ip:port. We can't do hostname-based matching
-        # at this layer (DNS resolution happens in the sandboxed process);
-        # what we have is a permissive network-outbound for the allowlist.
-        rules.append(f';; allowlist host: {host}')
-    # For now, if there are any allowed hosts, allow network-outbound entirely.
-    # This is a known limitation — sandbox-exec doesn't support hostname
-    # filtering. We document this in SAFETY.md.
+        # Documentation-only — sandbox-exec can't enforce per-host rules.
+        rules.append(f';; requested host: {host} (not enforced — see comment)')
     if allowed_hosts:
-        rules.append('(allow network-outbound)')
-        rules.append('(allow network-inbound)')
-    else:
-        # No outbound except localhost (already allowed above).
-        pass
+        # Pass-through of comments only; no actual outbound allow rule.
+        # This is a deliberate choice: better to break outbound HTTPS for
+        # the agent than to silently disable the network sandbox.
+        rules.append(
+            ';; sandbox-exec cannot filter outbound by hostname.\n'
+            ';; All non-localhost outbound is DENIED. To override,\n'
+            ';; run with FORGE_DISABLE_SANDBOX=1 (NOT recommended).'
+        )
     return "\n".join(rules)
 
 

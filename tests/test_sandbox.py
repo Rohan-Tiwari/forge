@@ -63,14 +63,24 @@ class TestBuildProfile:
         # No catch-all outbound allow
         assert "(allow network-outbound)" not in prof
 
-    def test_profile_with_allowlist_opens_outbound(self, tmp_path):
-        """When the user provides any host, sandbox-exec can't filter
-        per-host so we open outbound entirely (documented limitation)."""
+    def test_profile_with_allowlist_does_NOT_open_outbound(self, tmp_path):
+        """Regression for v0.2.1 audit finding #1.
+
+        sandbox-exec can't filter outbound by hostname. The previous
+        implementation responded to a non-empty allowlist by emitting
+        `(allow network-outbound)` which was a silent no-op of the network
+        sandbox. The current behavior: allowed_network_hosts is treated as
+        an informational comment ONLY, and outbound stays denied unless
+        the user explicitly disables the sandbox via FORGE_DISABLE_SANDBOX.
+        """
         prof = build_profile(workspace=tmp_path,
                              allowed_network_hosts=["api.example.com"])
-        assert "(allow network-outbound)" in prof
-        # But the comment shows what was requested
+        # We DO record the requested host as a comment
         assert "api.example.com" in prof
+        # But we do NOT silently open the network
+        assert "(allow network-outbound)" not in prof
+        # And we DO surface the limitation in the profile itself
+        assert "DENIED" in prof or "denied" in prof.lower()
 
     def test_profile_allows_python_subprocess(self, tmp_path):
         """Bash() needs to be able to spawn /bin/sh and friends."""

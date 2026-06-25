@@ -50,6 +50,30 @@ _MANIFEST_PATH = SKILLS_HOME / "manifest.toml"
 # Floating refs we refuse without --pin confirmation.
 _FLOATING_REFS = {"main", "master", "HEAD", "trunk", "develop", "latest"}
 
+# Valid git ref name pattern. We additionally refuse leading '-' since
+# git interprets that as an option flag, allowing argument injection
+# (e.g. '--upload-pack=/path/evil' as a "ref" would execute arbitrary
+# binaries during fetch). See v0.2.1 audit finding #2.
+_VALID_REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def _is_safe_ref(ref: str) -> bool:
+    """A git ref is 'safe' for argv-positional use IFF:
+
+    1. Matches our restrictive character set ([A-Za-z0-9._/-])
+    2. Does NOT start with '-' (would be parsed as an option flag)
+    3. Does NOT contain '..' (path traversal in some git ref semantics)
+    """
+    if not ref:
+        return False
+    if ref.startswith("-"):
+        return False
+    if ".." in ref:
+        return False
+    if not _VALID_REF_RE.match(ref):
+        return False
+    return True
+
 
 # =============================================================================
 # Errors
@@ -380,12 +404,32 @@ def prepare_install(spec: SkillSpec, *, allow_floating: bool = False,
     Doesn't move anything to the final location — that's `execute_install`.
     Splitting the two means the CLI can show the plan first.
     """
+    # SECURITY: validate the ref BEFORE invoking git. An attacker-controlled
+    # ref like '--upload-pack=/path/evil' would be parsed by git as an
+    # option flag, allowing arbitrary local binary execution during fetch.
+    # See v0.2.1 audit finding #2.
+    if not _is_safe_ref(spec.ref):
+        raise InstallError(
+            f"refusing to use unsafe git ref {spec.ref!r}. "
+            f"Refs must match [A-Za-z0-9._/-]+ and may not start with '-' "
+            f"or contain '..'."
+        )
+
     if is_floating_ref(spec.ref) and not allow_floating:
         raise FloatingRefError(
             f"refusing to install floating ref {spec.ref!r}. "
             f"Pass --pin to accept that this version may move under your feet, "
             f"or specify a sha/tag instead."
         )
+
+    # SECURITY: validate subdir if present. Resolving to a path outside the
+    # cloned workdir would let an attacker reference any file on disk
+    # (e.g. subdir='../../etc/passwd').
+    if spec.subdir:
+        if ".." in Path(spec.subdir).parts:
+            raise InstallError(
+                f"refusing subdir with '..' component: {spec.subdir!r}"
+            )
 
     work_root = work_root or (SKILLS_HOME / ".tmp")
     work_root.mkdir(parents=True, exist_ok=True)
@@ -394,15 +438,35 @@ def prepare_install(spec: SkillSpec, *, allow_floating: bool = False,
     ).hexdigest()[:16]
 
     # Clone (shallow). git clone --depth=1 + fetch the specific ref.
-    _git("clone", "--quiet", "--depth", "1", spec.url, str(workdir))
+    # SECURITY: use a positional separator '--' so even a future regression
+    # can't reinterpret the URL as a flag. And use isolated git config to
+    # prevent the user's global config (smudge filters, core.hooksPath)
+    # from running attacker-controlled code during the clone.
+    isolated_env = _isolated_git_env()
+    subprocess.run(  # noqa: S603,S607
+        ["git", "clone", "--quiet", "--depth", "1", "--", spec.url, str(workdir)],
+        env=isolated_env, capture_output=True, text=True, check=True,
+    )
     # The ref might not be the default branch; try to fetch + checkout.
     try:
-        _git("fetch", "--quiet", "--depth", "1", "origin", spec.ref, cwd=workdir)
-        _git("checkout", "--quiet", "FETCH_HEAD", cwd=workdir)
+        # SECURITY: '--' separator forces git to treat spec.ref as a positional
+        # argument (refspec), not an option. Already validated above too,
+        # but defense-in-depth.
+        subprocess.run(  # noqa: S603,S607
+            ["git", "fetch", "--quiet", "--depth", "1", "origin", "--", spec.ref],
+            cwd=workdir, env=isolated_env, capture_output=True, text=True, check=True,
+        )
+        subprocess.run(  # noqa: S603,S607
+            ["git", "checkout", "--quiet", "FETCH_HEAD"],
+            cwd=workdir, env=isolated_env, capture_output=True, text=True, check=True,
+        )
     except subprocess.CalledProcessError:
         # Maybe `ref` IS the default branch already. Try direct checkout.
         try:
-            _git("checkout", "--quiet", spec.ref, cwd=workdir)
+            subprocess.run(  # noqa: S603,S607
+                ["git", "checkout", "--quiet", "--", spec.ref],
+                cwd=workdir, env=isolated_env, capture_output=True, text=True, check=True,
+            )
         except subprocess.CalledProcessError as e:
             shutil.rmtree(workdir, ignore_errors=True)
             raise InstallError(
@@ -410,11 +474,29 @@ def prepare_install(spec: SkillSpec, *, allow_floating: bool = False,
             ) from e
 
     # Resolve to a sha for content-addressed pinning.
-    sha = _git("rev-parse", "HEAD", cwd=workdir).stdout.strip()
+    sha_proc = subprocess.run(  # noqa: S603,S607
+        ["git", "rev-parse", "HEAD"],
+        cwd=workdir, env=isolated_env, capture_output=True, text=True, check=True,
+    )
+    sha = sha_proc.stdout.strip()
 
     # Where do the skills live? If user passed :subdir, only that path.
-    # Otherwise: any folder containing SKILL.md, recursively.
-    scan_root = workdir / spec.subdir if spec.subdir else workdir
+    # SECURITY: resolve and verify the subdir stays inside the workdir
+    # (defense-in-depth — we already rejected '..' but realpath catches
+    # symlink-based escapes too).
+    if spec.subdir:
+        scan_root = (workdir / spec.subdir).resolve()
+        workdir_real = workdir.resolve()
+        try:
+            scan_root.relative_to(workdir_real)
+        except ValueError:
+            shutil.rmtree(workdir, ignore_errors=True)
+            raise InstallError(
+                f"subdir {spec.subdir!r} resolves outside the clone "
+                f"({scan_root} not under {workdir_real})"
+            )
+    else:
+        scan_root = workdir
 
     # Find skills in the tree
     skill_dirs: list[Path] = []
@@ -437,6 +519,31 @@ def prepare_install(spec: SkillSpec, *, allow_floating: bool = False,
         skills_found=[d.name for d in skill_dirs],
         findings=findings,
     )
+
+
+def _isolated_git_env() -> dict[str, str]:
+    """Return an env that neutralizes the user's git config during a clone.
+
+    SECURITY: by default, a git clone runs the user's globally-configured
+    smudge filters, hooks, and credential helpers — any of which could
+    execute attacker-controlled code from the cloned repo. We point git
+    at empty config files to prevent that.
+    """
+    from forge._subprocess_env import build_minimal_env
+    env = build_minimal_env(
+        # Git wants to know the user's identity for some operations even
+        # without committing. Provide a no-op identity.
+        extra={
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",  # never prompt for credentials
+            "GIT_AUTHOR_NAME": "forge",
+            "GIT_AUTHOR_EMAIL": "forge@localhost",
+            "GIT_COMMITTER_NAME": "forge",
+            "GIT_COMMITTER_EMAIL": "forge@localhost",
+        },
+    )
+    return env
 
 
 def execute_install(plan: InstallPlan) -> ManifestEntry:

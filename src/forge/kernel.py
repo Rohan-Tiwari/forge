@@ -274,11 +274,18 @@ class Kernel:
         result_r, result_w = os.pipe()
         os.set_inheritable(result_w, True)
 
-        env = os.environ.copy()
+        # SECURITY: build a MINIMAL env for the kernel worker rather than
+        # inheriting the parent's. This prevents provider secrets (API keys,
+        # GitHub tokens) from being readable by agent-emitted code via
+        # os.environ. The worker still needs FORGE_SRC_PATH (to import
+        # forge.tools) + FORGE_RESULT_FD (the new pipe).
+        from forge._subprocess_env import build_minimal_env
         forge_src = str(Path(__file__).resolve().parent.parent)
-        env["FORGE_SRC_PATH"] = forge_src
-        env["FORGE_RESULT_FD"] = str(result_w)
-        env["PYTHONUNBUFFERED"] = "1"
+        env = build_minimal_env(extra={
+            "FORGE_SRC_PATH": forge_src,
+            "FORGE_RESULT_FD": str(result_w),
+            "PYTHONUNBUFFERED": "1",
+        })
 
         # Build the command. If sandboxing is on AND supported, wrap with
         # sandbox-exec. Profile is bound to the current workspace.
