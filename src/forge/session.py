@@ -452,6 +452,19 @@ class Session:
 
             # Feed observation back to the model.
             obs_text = f"Observation:\n```\n{obs.format()}\n```"
+
+            # v0.2.4 — nudge the model to stop when the cell succeeded.
+            # gpt-oss:20b under-trusts null results (0 files, [], False) and
+            # loops re-verifying. After a clean cell, remind it: trust the
+            # kernel, reply in prose if you have an answer.
+            if obs.ok and obs.stderr.strip() == "":
+                obs_text += (
+                    "\n\n(The cell ran cleanly. If this output answers the "
+                    "user's question — including null/empty/zero answers — "
+                    "reply in plain prose now. Do NOT re-verify with another "
+                    "cell unless you need genuinely different information.)"
+                )
+
             self._history.append({"role": "user", "content": obs_text})
 
             if self.kernel.health.is_wedged():

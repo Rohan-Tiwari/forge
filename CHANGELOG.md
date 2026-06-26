@@ -3,6 +3,38 @@
 All notable changes to Forge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.4] — 2026-06-26 — stop looping on null results
+
+### Fixed
+
+- **gpt-oss:20b looped on null/zero answers instead of terminating.** With
+  the harmony fixes in v0.2.2/v0.2.3 finally letting cells run cleanly, a
+  deeper behavioral issue became visible: when the kernel returned a
+  correct but "boring" result like `0 files`, `[]`, or `False`, the model
+  refused to believe it. It re-ran the same operation with slightly
+  different phrasing 7+ times until hitting the 12-cell cap, leaving the
+  user with `(stopped after 12 cells without prose end)`.
+
+  This is not a sandbox or visibility bug — paths outside the workspace
+  ARE readable (sandbox-exec allows all file reads; only writes are
+  restricted). The kernel reported the truth; the model just didn't
+  trust it.
+
+  Two-layer prompt-engineering fix:
+
+  1. **System prompt** — new "Stopping criterion" section with an explicit
+     table of when to stop ("0 files" → reply in prose, not retry) and
+     when to write another cell (genuine exceptions or genuinely
+     incomplete output).
+  2. **Per-cell observation hint** — when a cell runs cleanly with no
+     stderr, the synthetic `Observation:` block now appends:
+     > "The cell ran cleanly. If this output answers the user's question
+     > — including null/empty/zero answers — reply in plain prose now."
+
+  Verified end-to-end with the exact failing query: `forge run "How many
+  Python files are in /Users/.../skill-eval/skills..."` now completes in
+  **1 cell with a direct prose answer**, down from 7 cells + cell-cap.
+
 ## [0.2.3] — 2026-06-25 — never display a parse-recovered fragment
 
 ### Fixed
