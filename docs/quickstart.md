@@ -21,13 +21,19 @@ ollama pull qwen2.5vl:7b   # optional, for vision
 
 ## Install Forge
 
-From PyPI (once published):
+From a GitHub Release (recommended):
 
 ```bash
-pip install forge-agent
+pip install https://github.com/Rohan-Tiwari/forge/releases/download/v0.2.4/forge_agent-0.2.4-py3-none-any.whl
 ```
 
-From source:
+Or pin to a tag without releases:
+
+```bash
+pip install git+https://github.com/Rohan-Tiwari/forge.git@v0.2.4
+```
+
+From source (for development):
 
 ```bash
 git clone https://github.com/Rohan-Tiwari/forge.git
