@@ -1,0 +1,13 @@
+{
+  "app_name": "forge-eval",
+  "version": "1.0.0",
+  "features": {
+    "streaming": true,
+    "vision": false,
+    "daemon": true
+  },
+  "limits": {
+    "max_cells_per_turn": 12,
+    "max_retries": 2
+  }
+}

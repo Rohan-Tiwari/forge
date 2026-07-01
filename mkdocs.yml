@@ -41,6 +41,9 @@ nav:
   - CLI reference: cli.md
   - Writing skills: skills.md
   - Safety model: SAFETY.md
+  - Evaluation:
+      - Overview: eval/index.md
+      - Latest report (v0.2.4): eval/report.md
   - Audit report (v0.2.1): V021-AUDIT.json
   - Dogfood report (W4): W4-DOGFOOD.md
   - API reference:
