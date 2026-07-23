@@ -185,6 +185,67 @@ class TestDryRunFallbacks:
         assert any("dry-run errored" in r or "RuntimeError" in r
                    for r in preview.flagged_reasons)
 
+
+# =============================================================================
+# Tool-name parity between the kernel and the dry-run overlay.
+#
+# Regression guard: the dry-run runs cells in a SEPARATE subprocess with its
+# own GLOBALS. When a new tool was added to kernel_globals() but not the
+# dry-run driver, previewing a cell that called it failed with a NameError
+# ("read_document is not defined") even though the real run would have worked.
+# These tests keep the two global sets from drifting again.
+# =============================================================================
+
+
+class TestKernelDryRunParity:
+    def test_read_document_is_available_in_dry_run(self, tmp_path):
+        """The exact bug: read_document must resolve in the preview subprocess,
+        not raise NameError."""
+        doc = tmp_path / "notes.txt"
+        doc.write_text("hello from the document")
+        code = 'text = read_document("notes.txt")\nprint(text)'
+        gate = check(_wrap(code))
+        preview = Preview.from_dry_run(gate, code=code, workspace=tmp_path)
+        # No NameError in the flagged reasons.
+        assert not any("read_document" in r and "not defined" in r
+                       for r in preview.flagged_reasons)
+        assert not any("NameError" in r for r in preview.flagged_reasons)
+
+    def test_resolve_path_is_available_in_dry_run(self, tmp_path):
+        (tmp_path / "f.txt").write_text("x")
+        code = 'p = resolve_path("f.txt")\nprint(p)'
+        gate = check(_wrap(code))
+        preview = Preview.from_dry_run(gate, code=code, workspace=tmp_path)
+        assert not any("NameError" in r for r in preview.flagged_reasons)
+
+    def test_no_kernel_tool_is_missing_from_dry_run_driver(self):
+        """Every callable the kernel injects must also be a name the dry-run
+        driver defines/imports — otherwise previewing a cell that uses it
+        NameErrors. We check the driver source string for each tool name.
+
+        Side-effecting tools (Bash/search/see/find_skill/run_skill/call_mcp)
+        are intentionally STUBBED in the driver rather than imported, but the
+        NAME must still be present — which is exactly what this asserts.
+        """
+        from forge.preview import _DRY_RUN_DRIVER
+        from forge.tools import kernel_globals
+
+        driver_src = _DRY_RUN_DRIVER
+        missing = []
+        for name, obj in kernel_globals().items():
+            # Only tool callables need to be in scope; the re-exported error
+            # classes are convenience and not required by the driver.
+            if not callable(obj):
+                continue
+            # The name must appear in the driver source (as a def, an import,
+            # or a GLOBALS entry).
+            if name not in driver_src:
+                missing.append(name)
+        assert not missing, (
+            f"kernel tools missing from the dry-run driver (would NameError "
+            f"when previewed): {missing}"
+        )
+
     def test_skip_dirs_not_copied(self, tmp_path):
         """The overlay doesn't copy .git, __pycache__, .venv, node_modules.
         Without this, dry-run on a real repo would be miserably slow."""

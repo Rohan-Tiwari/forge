@@ -232,6 +232,254 @@ def Edit(path: str | os.PathLike[str], old: str, new: str, *, replace_all: bool 
     absolute.write_text(new_text, encoding="utf-8")
 
 
+# =============================================================================
+# Path resolution + document reading.
+#
+# These exist because the model kept hand-rolling `Path(name).exists()` checks
+# in throwaway cell code — which fail the moment the user names a bare file
+# that lives in ~/Downloads, and then report "file does not exist" instead of
+# looking for it. Moving the logic into tested primitives means the model
+# calls one function instead of reinventing (badly) path resolution and
+# extraction on every task.
+# =============================================================================
+
+# Directories searched, in order, when a bare filename isn't found relative to
+# cwd. Home comes last (shallow, non-recursive) to avoid scanning the world.
+_COMMON_FILE_LOCATIONS: tuple[str, ...] = (
+    ".",
+    "~/Downloads",
+    "~/Desktop",
+    "~/Documents",
+    "~",
+)
+
+
+class FileResolutionError(FileNotFoundError):
+    """Raised by resolve_path when a path can't be found anywhere we looked.
+
+    Carries the locations searched so the caller (and the user) can see the
+    resolution was actually attempted, not skipped.
+    """
+
+    def __init__(self, name: str, searched: list[str]):
+        self.name = name
+        self.searched = searched
+        super().__init__(
+            f"could not find {name!r}. Looked in: {', '.join(searched)}"
+        )
+
+
+def resolve_path(path: str | os.PathLike[str]) -> Path:
+    """Resolve a user-supplied path to an existing file, robustly.
+
+    Users name files loosely ("LG2964.pdf") and often mean a file that lives
+    in ~/Downloads or similar, not the current directory. This tries, in order:
+
+      1. The path as given (after ~/env expansion).
+      2. If that misses AND the path is a bare name (no directory separator),
+         each of _COMMON_FILE_LOCATIONS: cwd, ~/Downloads, ~/Desktop,
+         ~/Documents, then a shallow scan of the home dir.
+
+    Returns the first existing match as an absolute, canonicalized Path.
+    Raises FileResolutionError (a FileNotFoundError subclass) listing every
+    location searched if nothing matches — so a genuine miss is honest and
+    debuggable, never silent.
+
+    Safety: an empty/whitespace path is rejected (it would otherwise resolve
+    to the current directory). And resolve_path REFUSES to locate protected
+    paths — it will not help find `~/.ssh`, `.env`, `credentials`, etc., even
+    though read_document/Read would independently block reading them. Defense
+    in depth: the resolver shouldn't surface a secret's location either.
+    """
+    name = os.fspath(path)
+    if not name or not name.strip():
+        raise FileResolutionError(name, [])
+
+    # 1. As given.
+    direct = _expand(path)
+    if direct.exists():
+        if is_protected_path(direct):
+            raise ProtectedPathError(
+                f"refusing to resolve protected path: {path}"
+            )
+        return direct
+
+    searched: list[str] = [str(direct)]
+
+    # 2. Only auto-search when it's a bare filename — if the user gave a
+    # directory component, honor it literally rather than guessing elsewhere.
+    has_dir_component = os.sep in name or (os.altsep and os.altsep in name)
+    basename = os.path.basename(name)
+    if not has_dir_component and basename:
+        for loc in _COMMON_FILE_LOCATIONS:
+            base = _expand(loc)
+            candidate = base / basename
+            searched.append(str(candidate))
+            if candidate.is_file():
+                if is_protected_path(candidate):
+                    # Don't surface a protected file's location via bare-name
+                    # search; treat it as if not found here and keep looking.
+                    continue
+                return candidate
+
+    raise FileResolutionError(name, searched)
+
+
+# File extensions read_document knows how to extract text from beyond plain
+# read. Everything else falls through to a UTF-8 read.
+_PDF_SUFFIXES = {".pdf"}
+
+
+def read_document(
+    path: str | os.PathLike[str], *, max_chars: int = 200_000
+) -> str:
+    """Read a document's text content, resolving the path and picking an
+    extractor by file type. The robust replacement for hand-rolled
+    read-a-file-maybe-a-pdf cell code.
+
+    Behavior:
+      * Resolves `path` via resolve_path() (so bare names in ~/Downloads etc.
+        are found). Raises FileResolutionError if it truly can't be located.
+      * Enforces is_protected_path() on the resolved file — same guarantee as
+        Read(); a secret can't be laundered through this helper.
+      * PDFs: extracts text via the `pdftotext` CLI when present, else falls
+        back to the `pypdf` library. If NEITHER is available, raises a clear
+        RuntimeError naming exactly what to install — it does not silently
+        return nothing.
+      * Everything else: decoded as UTF-8 text (errors replaced).
+
+    Returns the extracted text, truncated to `max_chars` with a visible
+    truncation marker. Never returns an empty string masking a failure: an
+    empty extraction from a real file raises so the model reports it honestly.
+    """
+    resolved = resolve_path(path)
+    if is_protected_path(resolved):
+        raise ProtectedPathError(f"refusing to read protected path: {path}")
+    if resolved.is_dir():
+        raise IsADirectoryError(f"is a directory: {resolved}")
+
+    suffix = resolved.suffix.lower()
+
+    if suffix in _PDF_SUFFIXES:
+        text = _extract_pdf_text(resolved)
+    else:
+        data = resolved.read_bytes()
+        text = data.decode("utf-8", errors="replace")
+
+    if not text.strip():
+        raise RuntimeError(
+            f"extracted no text from {resolved.name}. The file may be empty or "
+            f"corrupted. For scanned/image-only PDFs, install poppler "
+            f"(`brew install poppler`) so the vision-OCR fallback can run."
+        )
+
+    if len(text) > max_chars:
+        text = text[:max_chars] + (
+            f"\n\n... [truncated to {max_chars} chars of "
+            f"{len(text)} total]"
+        )
+    return text
+
+
+def _extract_pdf_text(resolved: Path) -> str:
+    """Extract text from a PDF: pdftotext CLI first, then pypdf (auto-installed
+    if missing), then vision-OCR via pdftoppm + see() for scanned/image PDFs.
+    Raises a clear, actionable error only if every option fails."""
+    # 1. pdftotext CLI — fast, high-fidelity, preserves layout.
+    if _shutil.which("pdftotext"):
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["pdftotext", "-layout", str(resolved), "-"],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout
+        # Non-zero or empty — fall through rather than giving up.
+
+    # 2. pypdf library fallback — auto-install it if it's not present rather
+    # than making the user do it by hand. This is the "just complete the task"
+    # behavior: a missing pure-Python dependency is an implementation detail,
+    # not a wall the user should hit.
+    pypdf = _import_or_pip_install("pypdf")
+    if pypdf is not None:
+        try:
+            reader = pypdf.PdfReader(str(resolved))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            if text.strip():
+                return text
+            # Empty — PDF is likely scanned/image-only; fall through to OCR.
+        except Exception as e:  # noqa: BLE001 — surface as an actionable error
+            raise RuntimeError(f"pypdf failed to read {resolved.name}: {e}") from e
+
+    # 3. Vision-OCR fallback for scanned / image-only PDFs — rasterize each
+    # page with pdftoppm (part of poppler) and pass the PNG bytes to see().
+    if _shutil.which("pdftoppm"):
+        import tempfile as _tempfile
+        ocr_prompt = (
+            "You are an OCR engine. Transcribe ALL text in this page exactly as "
+            "it appears, preserving layout, line breaks, and punctuation. "
+            "Output only the transcribed text, nothing else."
+        )
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            proc = subprocess.run(  # noqa: S603
+                ["pdftoppm", "-png", "-r", "200", str(resolved),
+                 f"{tmpdir}/page"],
+                capture_output=True, timeout=300, check=False,
+            )
+            if proc.returncode == 0:
+                import glob as _glob
+                pages = sorted(_glob.glob(f"{tmpdir}/page-*.png"))
+                if pages:
+                    page_texts = []
+                    for png in pages:
+                        page_texts.append(see(Path(png), prompt=ocr_prompt))
+                    return "\n\n".join(page_texts)
+
+    raise RuntimeError(
+        f"cannot extract text from {resolved.name}: no PDF backend available "
+        f"and automatic `pip install pypdf` failed. Install one manually with "
+        f"`pip install pypdf` or `brew install poppler` (for the pdftotext CLI "
+        f"and pdftoppm OCR fallback)."
+    )
+
+
+def _import_or_pip_install(module: str, *, package: str | None = None) -> Any | None:
+    """Import `module`, transparently `pip install`-ing it once if absent.
+
+    Returns the imported module, or None if it's missing AND the install
+    failed. Used to make pure-Python dependencies (e.g. pypdf) self-healing so
+    the agent completes the task instead of telling the user to install things.
+
+    The install is best-effort and bounded: it targets the CURRENT interpreter
+    (`sys.executable -m pip install`), runs quietly with a timeout, and never
+    raises — a failure just returns None so the caller can fall through to its
+    honest error path. Only call this for trusted, named dependencies, never
+    with user-controlled package names.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(module)
+    except ImportError:
+        pass
+
+    pkg = package or module
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, trusted package name
+            [sys.executable, "-m", "pip", "install", "--quiet", pkg],
+            capture_output=True, text=True, timeout=180, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    # Invalidate import caches so the freshly-installed package is importable.
+    importlib.invalidate_caches()
+    try:
+        return importlib.import_module(module)
+    except ImportError:
+        return None
+
+
 @dataclass
 class BashResult:
     cmd: str
@@ -332,6 +580,7 @@ def search(pattern: str, *, path: str | os.PathLike[str] = ".",
 
 
 _FIND_SKILL: Callable[[str], list[dict[str, Any]]] = lambda q: []
+_READ_SKILL: Callable[[str], str | None] = lambda name: None
 _RUN_SKILL: Callable[..., Any] = lambda *a, **kw: (_ for _ in ()).throw(
     RuntimeError("run_skill not wired; install via forge.tools.set_skill_runtime()")
 )
@@ -464,6 +713,24 @@ def find_skill(query: str) -> list[dict[str, Any]]:
     return _FIND_SKILL(query)
 
 
+def read_skill(name: str) -> str:
+    """Load a skill's FULL instructions (its SKILL.md body) on demand.
+
+    Progressive disclosure: the system prompt lists only skill names +
+    one-line descriptions to keep context small. When you decide to use a
+    skill, call this to pull its complete instructions into view. Raises
+    KeyError if there's no installed skill with that name (use find_skill()
+    to discover the right name first).
+    """
+    body = _READ_SKILL(name)
+    if body is None:
+        raise KeyError(
+            f"no installed skill named {name!r}; call find_skill(query) to "
+            f"discover available skills"
+        )
+    return body
+
+
 def run_skill(name: str, **kwargs: Any) -> Any:
     """Invoke another skill by name. Activates if not already active."""
     return _RUN_SKILL(name, **kwargs)
@@ -482,6 +749,7 @@ def call_mcp(server: str, tool: str, **arguments: Any) -> Any:
 def set_skill_runtime(
     *,
     find: Callable[[str], list[dict[str, Any]]] | None = None,
+    read: Callable[[str], str | None] | None = None,
     run: Callable[..., Any] | None = None,
     see_fn: Callable[[Any], str] | None = None,  # deprecated; see() is real now
     mcp: Callable[..., Any] | None = None,
@@ -492,9 +760,11 @@ def set_skill_runtime(
     that talks to the vision sub-skill via the Ollama API directly. The
     parameter is kept for backward compatibility and ignored.
     """
-    global _FIND_SKILL, _RUN_SKILL, _CALL_MCP
+    global _FIND_SKILL, _READ_SKILL, _RUN_SKILL, _CALL_MCP
     if find is not None:
         _FIND_SKILL = find
+    if read is not None:
+        _READ_SKILL = read
     if run is not None:
         _RUN_SKILL = run
     if mcp is not None:
@@ -668,10 +938,14 @@ def kernel_globals() -> dict[str, Any]:
         "Bash": Bash,
         "search": search,
         "see": see,
+        "resolve_path": resolve_path,
+        "read_document": read_document,
         "find_skill": find_skill,
+        "read_skill": read_skill,
         "run_skill": run_skill,
         "call_mcp": call_mcp,
         # Convenience re-exports
         "ProtectedPathError": ProtectedPathError,
         "ProtectedActionError": ProtectedActionError,
+        "FileResolutionError": FileResolutionError,
     }

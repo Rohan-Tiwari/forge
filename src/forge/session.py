@@ -116,6 +116,11 @@ class Session:
 
         self._history: list[dict[str, str]] = []
         self._system_prompt: str = ""
+        self.instruction_files: list[str] = []
+        self.resumed_from: str | None = None
+        # Optional Rich Live region set by the streaming CLI runner so the
+        # confirm prompt can pause it. None outside streaming chat.
+        self._live_region: object | None = None
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -131,9 +136,13 @@ class Session:
         self.kernel.start()
         self.shadow.init()
 
-        # Wire skill + MCP callbacks.
+        # Wire skill + MCP callbacks. Give the registry the router so
+        # find_skill can rank by meaning (progressive disclosure); read_skill
+        # loads a skill's full body on demand.
+        self.skills.router = self.router
         tools.set_skill_runtime(
             find=self.skills.find,
+            read=self.skills.read_full,
             run=self._run_skill,
             mcp=self.mcp.call,
         )
@@ -149,6 +158,7 @@ class Session:
             skills=len(self.skills.skills),
             mcp_servers=len(self.mcp.configs),
             driver_model=self.router.roles["driver"].primary,
+            instruction_files=self.instruction_files,
         )
 
     def close(self) -> None:
@@ -164,14 +174,117 @@ class Session:
         except Exception:  # noqa: BLE001 — never let MCP cleanup mask user errors
             pass
 
+    # ---- cross-session resume ------------------------------------------
+
+    def _session_state_path(self, session_id: str | None = None) -> Path:
+        from forge.config import sessions_dir
+        return sessions_dir(self.workspace) / f"{session_id or self.session_id}.json"
+
+    def _persist_state(self) -> None:
+        """Save this session's conversation state so it can be resumed later.
+
+        Persists the message history (system prompt is NOT stored — it's
+        rebuilt fresh on resume so prompt/skill changes take effect) plus
+        minimal metadata. Best-effort: a write failure is logged, never fatal.
+
+        Honest scope: only the CONVERSATION is saved. Kernel globals (variables
+        the agent defined in cells) are NOT — a resumed session starts with a
+        fresh kernel. The resume banner says so.
+        """
+        import json
+
+        from forge.config import sessions_dir
+        try:
+            sessions_dir(self.workspace).mkdir(parents=True, exist_ok=True)
+            # Drop the system message (index 0) — rebuilt on resume.
+            persisted = [m for m in self._history if m.get("role") != "system"]
+            payload = {
+                "version": 1,
+                "session_id": self.session_id,
+                "workspace": str(self.workspace),
+                "spent_usd": round(self.router.spent_usd, 6),
+                "messages": persisted,
+            }
+            self._session_state_path().write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+        except OSError as e:
+            self.log.write("session.persist_failed", error=str(e))
+
+    def resume_from(self, session_id: str | None = None) -> int:
+        """Restore conversation history from a persisted session.
+
+        If `session_id` is None, resumes the MOST RECENT persisted session in
+        this workspace (the `--continue` semantics). Returns the number of
+        prior messages restored (0 if none found). Must be called after
+        start() — it appends restored messages after the fresh system prompt.
+
+        Kernel globals are NOT restored; the caller should surface an honest
+        banner (the CLI does).
+        """
+        import json
+
+        from forge.config import sessions_dir
+        sdir = sessions_dir(self.workspace)
+        if session_id is not None:
+            path = sdir / f"{session_id}.json"
+        else:
+            path = self._most_recent_session_file(sdir)
+        if path is None or not path.exists():
+            return 0
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            self.log.write("session.resume_failed", error=str(e))
+            return 0
+        messages = payload.get("messages") or []
+        if not isinstance(messages, list):
+            return 0
+        # Append restored messages after the (already-set) system prompt.
+        # Only user/assistant turns — a persisted 'system' entry must never
+        # inject a second system prompt.
+        restored = [
+            m for m in messages
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+        ]
+        self._history.extend(restored)
+        self.resumed_from = payload.get("session_id")
+        self.log.write(
+            "session.resumed",
+            from_session=payload.get("session_id"),
+            messages=len(restored),
+        )
+        return len(restored)
+
+    @staticmethod
+    def _most_recent_session_file(sdir: Path) -> Path | None:
+        if not sdir.is_dir():
+            return None
+        files = [p for p in sdir.glob("*.json") if p.is_file()]
+        if not files:
+            return None
+        return max(files, key=lambda p: p.stat().st_mtime)
+
     # ---- helpers --------------------------------------------------------
 
     def _build_system_prompt(self) -> str:
         base = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+        parts = [base]
+
         skill_block = self.skills.render_for_system_prompt()
         if skill_block:
-            return base + "\n\n" + skill_block
-        return base
+            parts.append(skill_block)
+
+        # Project/user instruction files (FORGE.md / AGENTS.md). Loaded under
+        # a visible source-labelled header; loaded paths are recorded for the
+        # run header + audit log so the injection surface stays inspectable.
+        from forge.config import load_project_instructions
+        instr_block, loaded = load_project_instructions(self.workspace)
+        self.instruction_files = loaded
+        if instr_block:
+            parts.append(instr_block)
+
+        return "\n\n".join(parts)
 
     def _run_skill(self, name: str, **kwargs: object) -> object:
         """Implementation of run_skill(). Calls the skill's main() in-process.
@@ -219,6 +332,23 @@ class Session:
     # ---- the agent loop -------------------------------------------------
 
     def turn(
+        self,
+        user_msg: str,
+        *,
+        on_chunk: ChunkCallback | None = None,
+    ) -> TurnResult:
+        """Run one user-turn and persist conversation state afterward.
+
+        Thin wrapper over _turn_inner so cross-session resume state is saved
+        on every exit path (prose end, max cells, errors) without threading a
+        persist call through each return.
+        """
+        try:
+            return self._turn_inner(user_msg, on_chunk=on_chunk)
+        finally:
+            self._persist_state()
+
+    def _turn_inner(
         self,
         user_msg: str,
         *,
@@ -695,34 +825,216 @@ class Session:
     # ---- history truncation ----------------------------------------------
 
     def _maybe_truncate_history(self) -> None:
-        """Compress old turns if context is getting full.
+        """Compress old turns when context approaches the driver's limit.
 
-        Strategy:
-          1. Always keep: system prompt, the FIRST user message (the task),
-             every assistant cell with intent block, the last 6 messages
-             verbatim.
-          2. Compressible: older `Observation:` blocks (largest first), older
-             assistant prose.
+        Two-tier compaction (mirrors the v10 harness's basicCompact →
+        summarize escalation):
 
-        For v0.1 we use a simple char-count heuristic. v0.2 swaps in the
-        summarizer model role for actual semantic compression.
+        Tier 1 — cheap, no model call. Replace the bodies of old Observation
+        blocks with a short placeholder, keeping the last KEEP_RECENT_TURNS
+        exchanges verbatim. Most of the time this is enough and costs nothing.
+
+        Tier 2 — if Tier 1 doesn't get us under target, ask the (local,
+        zero-cost) `summarizer` role to condense the MIDDLE span into one
+        labelled `[forge:summary — model-generated, not verbatim]` block,
+        preserving task intent, files modified, decisions, and unresolved
+        errors. A labelled summary is more honest than silent deletion.
+
+        Error-signal-aware pruning (A2): the most recent traceback /
+        PostCheckFailed is preserved verbatim through both tiers so the model
+        keeps learning from its last mistake.
+
+        If the summarizer call fails (offline, cost ceiling, unknown role), we
+        fall back to blind char-count deletion so compaction never blocks a
+        turn.
         """
-        # Threshold: 80% of num_ctx, treating chars-as-tokens (conservative).
+        threshold, total = self._compaction_threshold()
+        if total < threshold:
+            return
+        if len(self._history) <= 8:
+            return  # nothing meaningful to compress
+
+        # --- Tier 1: evict old observation bodies (no model call) ---
+        target = self._compaction_target()
+        tier1_applied = self._compact_tier1(target)
+        _, total_after_t1 = self._compaction_threshold()
+        if total_after_t1 < threshold:
+            if tier1_applied:
+                self.log.write(
+                    "history.compact", mode="evict_observations",
+                    from_chars=total, to_chars=total_after_t1,
+                )
+            return
+
+        # --- Tier 2: LLM summarization of the middle span ---
+        keep_head = self._history[:2]     # system + first user (the task)
+        keep_tail = self._history[-6:]
+        middle = self._history[2:-6]
+        if not middle:
+            return
+
+        try:
+            summary = self._summarize_span(middle)
+        except Exception as e:  # noqa: BLE001 — never let compaction crash a turn
+            self.log.write("history.compact_failed", error=str(e))
+            self._blind_truncate_history()
+            return
+
+        if not summary:
+            # Summarizer produced nothing usable — fall back honestly.
+            self._blind_truncate_history()
+            return
+
+        # A2: keep the most recent error block from the middle verbatim so the
+        # model doesn't repeat the mistake the summary might smooth over.
+        last_error = self._last_error_message(middle)
+
+        new_middle: list[dict[str, str]] = [{
+            "role": "user",
+            "content": (
+                "[forge:summary — model-generated, not verbatim] "
+                "Earlier turns were compacted to save context:\n\n" + summary
+            ),
+        }]
+        if last_error is not None:
+            new_middle.append(last_error)
+
+        new_history = keep_head + new_middle + keep_tail
+        self.log.write(
+            "history.compact",
+            mode="semantic",
+            from_chars=total,
+            to_chars=sum(self._estimate_message_chars(m) for m in new_history),
+            from_messages=len(self._history),
+            to_messages=len(new_history),
+            kept_last_error=last_error is not None,
+        )
+        self._history = new_history
+
+    # Number of most-recent messages Tier 1 never touches.
+    _KEEP_RECENT_MESSAGES = 6
+
+    def _compact_tier1(self, target_chars: int) -> bool:
+        """Evict old Observation bodies until under `target_chars` or nothing
+        left to evict. Keeps the last _KEEP_RECENT_MESSAGES verbatim and never
+        evicts the most recent error block. Returns True if it changed
+        anything. No model call — this is the cheap tier.
+        """
+        head = self._history[:2]
+        tail = self._history[-self._KEEP_RECENT_MESSAGES:]
+        middle = self._history[2:-self._KEEP_RECENT_MESSAGES]
+        if not middle:
+            return False
+
+        last_error = self._last_error_message(middle)
+        changed = False
+        for m in middle:
+            total = sum(self._estimate_message_chars(x) for x in self._history)
+            if total <= target_chars:
+                break
+            content = m.get("content", "")
+            # Only evict large observation bodies; never the last error, never
+            # assistant intent cells (load-bearing), never already-evicted.
+            is_obs = content.startswith("Observation:") or "Observation:" in content[:20]
+            if (is_obs and m is not last_error
+                    and "[forge:observation-evicted]" not in content
+                    and len(content) > 200):
+                m["content"] = (
+                    "[forge:observation-evicted] "
+                    "(older tool output removed to save context)"
+                )
+                changed = True
+        return changed
+
+    @staticmethod
+    def _estimate_message_chars(m: dict[str, str]) -> int:
+        """Per-message size estimate (chars ≈ 4× tokens). Kept as a helper so
+        token accounting lives in one place if we later switch to real
+        tokenization."""
+        return len(m.get("content", ""))
+
+    def _compaction_target(self) -> int:
+        """Target size to compact DOWN to — 25% of num_ctx (chars), mirroring
+        v10's COMPACT_TARGET. Compacting to well under the threshold avoids
+        re-triggering on every subsequent turn."""
+        ctx_chars = self.router.roles["driver"].num_ctx * 4
+        return int(ctx_chars * 0.25)
+
+    def _compaction_threshold(self) -> tuple[int, int]:
+        """(threshold_chars, total_chars) for the current history.
+
+        Threshold is 80% of num_ctx, treating chars-as-tokens (conservative,
+        ~4 chars/token headroom is folded into the 80%)."""
         ctx_chars = self.router.roles["driver"].num_ctx * 4
         threshold = int(ctx_chars * 0.8)
         total = sum(len(m.get("content", "")) for m in self._history)
-        if total < threshold:
-            return
+        return threshold, total
 
-        # Keep system prompt + first user msg + last 6 entries verbatim.
+    @staticmethod
+    def _looks_like_error(content: str) -> bool:
+        """Heuristic: does this observation carry an error signal worth keeping?"""
+        markers = ("Traceback (most recent call last)", "PostCheckFailed",
+                   "Error:", "Exception", "FormatError", "UserDeny",
+                   "--- stderr ---")
+        return any(mk in content for mk in markers)
+
+    def _last_error_message(self, span: list[dict[str, str]]) -> dict[str, str] | None:
+        """The most recent message in `span` that carries an error signal."""
+        for m in reversed(span):
+            if self._looks_like_error(m.get("content", "")):
+                return m
+        return None
+
+    def _summarize_span(self, span: list[dict[str, str]]) -> str:
+        """Ask the summarizer role to condense a span of history.
+
+        Returns the summary text, or "" if the model produced nothing.
+        Raises on transport/router errors so the caller can fall back.
+        """
+        # Render the span as a plain transcript for the summarizer.
+        lines: list[str] = []
+        for m in span:
+            role = m.get("role", "?")
+            content = m.get("content", "")
+            lines.append(f"[{role}]\n{content}")
+        transcript = "\n\n".join(lines)
+
+        summ_system = (
+            "You are compacting an agent's working history to save context. "
+            "Produce a TERSE summary (<= 250 words) that preserves, in this "
+            "order:\n"
+            "1. The task being worked on.\n"
+            "2. Files created or modified (paths).\n"
+            "3. Key decisions and findings.\n"
+            "4. Any UNRESOLVED errors or open problems — keep these verbatim "
+            "if short.\n"
+            "Discard successful command output, greetings, and restated "
+            "context. Write plain prose or a short bullet list. Do NOT add "
+            "commentary about the summarization itself."
+        )
+        messages = [
+            {"role": "system", "content": summ_system},
+            {"role": "user", "content": transcript},
+        ]
+        completion = self.router.complete(messages, role="summarizer")
+        return completion.content.strip()
+
+    def _blind_truncate_history(self) -> None:
+        """Fallback compaction: char-count deletion of old observations.
+
+        This is the pre-v0.2.5 behaviour, retained as the safety net when
+        semantic summarization is unavailable. Keeps system prompt + first
+        user message + assistant intent blocks + last 6 messages; drops older
+        Observation blocks and non-intent prose.
+        """
+        total = sum(len(m.get("content", "")) for m in self._history)
         if len(self._history) <= 8:
-            return  # nothing meaningful to truncate
+            return
 
         keep_head = self._history[:2]   # system + first user
         keep_tail = self._history[-6:]
         middle = self._history[2:-6]
 
-        # Compress middle: replace Observation: blocks with a one-line summary.
         compressed: list[dict[str, str]] = []
         n_observations = 0
         n_replies = 0
@@ -733,14 +1045,12 @@ class Session:
                 continue
             if m.get("role") == "assistant":
                 n_replies += 1
-                # Keep assistant intent blocks verbatim — they're load-bearing
-                # for the model's next-turn context.
+                # Keep assistant intent blocks verbatim — load-bearing context.
                 if "```intent" in content:
                     compressed.append(m)
                 else:
                     continue
             else:
-                # User msg in the middle (gate-deny observations etc.)
                 continue
 
         if n_observations or n_replies:
@@ -754,6 +1064,7 @@ class Session:
         new_history = keep_head + compressed + keep_tail
         self.log.write(
             "history.truncate",
+            mode="blind",
             from_chars=total,
             to_chars=sum(len(m.get("content", "")) for m in new_history),
             from_messages=len(self._history),

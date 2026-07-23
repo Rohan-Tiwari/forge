@@ -91,8 +91,15 @@ _BASE_PROFILE = r"""(version 1)
 (allow ipc-posix-shm)
 
 ;; ---- network — outbound to localhost + allowlist hosts ----
+;; network-bind/inbound let a cell LISTEN on localhost; the agent reaching
+;; the local Ollama/vision model needs OUTBOUND to localhost too. Without
+;; this rule, connecting to localhost:11434 fails with "Operation not
+;; permitted" and see()/vision + any local-model tool is broken under the
+;; sandbox. localhost-only outbound keeps the exfil boundary intact
+;; (non-loopback outbound is still denied — see _make_network_rules).
 (allow network-bind (local ip "localhost:*"))
 (allow network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))
 {network_rules}
 """
 

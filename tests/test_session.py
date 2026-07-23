@@ -251,3 +251,34 @@ def test_session_id_is_stable(session):
     sid1 = session.session_id
     sid2 = session.session_id
     assert sid1 == sid2
+
+
+# =============================================================================
+# A3 — project-instruction files flow into the system prompt
+# =============================================================================
+
+
+def test_instruction_file_loaded_into_system_prompt(tmp_path, monkeypatch):
+    monkeypatch.setenv("FORGE_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "AGENTS.md").write_text("Use 2-space indent.", encoding="utf-8")
+    s = Session(workspace=tmp_path, mode="auto")
+    _patch_router(s, ["done"])
+    try:
+        assert "Use 2-space indent." in s._system_prompt
+        assert "[forge:project-instructions from" in s._system_prompt
+        assert any(p.endswith("AGENTS.md") for p in s.instruction_files)
+    finally:
+        s.close()
+
+
+def test_no_instruction_file_leaves_prompt_clean(tmp_path, monkeypatch):
+    monkeypatch.setenv("FORGE_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    s = Session(workspace=tmp_path, mode="auto")
+    _patch_router(s, ["done"])
+    try:
+        assert "[forge:project-instructions" not in s._system_prompt
+        assert s.instruction_files == []
+    finally:
+        s.close()

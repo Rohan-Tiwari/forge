@@ -181,6 +181,60 @@ main()
 '''
 
 
+def _make_rlimit_preexec() -> Any | None:
+    """Build a preexec_fn that applies POSIX rlimits to the kernel worker.
+
+    Returns None on platforms without the `resource` module (Windows), so the
+    caller can omit preexec_fn entirely — matching how sandbox-exec silently
+    no-ops off macOS. Reads the effective limits from forge.config; a 0 value
+    for any limit leaves that resource unbounded.
+
+    The returned callable runs in the CHILD after fork, before exec. It must
+    stay tiny and import-free beyond the already-imported `resource`: raising
+    here kills the child before the worker ever starts, which would surface as
+    a confusing pipe-closed error, so each setrlimit is guarded independently
+    and best-effort — a limit the OS rejects is skipped, not fatal.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None  # non-POSIX (Windows) — no rlimit support
+
+    from forge.config import resource_limits
+    limits = resource_limits()
+
+    # Map our config keys to (RLIMIT constant, value). Only include limits the
+    # running kernel actually exposes — RLIMIT_NPROC is absent on some systems.
+    plan: list[tuple[int, int]] = []
+    if limits["address_space_bytes"] > 0 and hasattr(resource, "RLIMIT_AS"):
+        plan.append((resource.RLIMIT_AS, limits["address_space_bytes"]))
+    if limits["file_size_bytes"] > 0 and hasattr(resource, "RLIMIT_FSIZE"):
+        plan.append((resource.RLIMIT_FSIZE, limits["file_size_bytes"]))
+    if limits["cpu_seconds"] > 0 and hasattr(resource, "RLIMIT_CPU"):
+        plan.append((resource.RLIMIT_CPU, limits["cpu_seconds"]))
+    if limits["processes"] > 0 and hasattr(resource, "RLIMIT_NPROC"):
+        plan.append((resource.RLIMIT_NPROC, limits["processes"]))
+
+    if not plan:
+        return None
+
+    def _apply() -> None:  # runs in the child, post-fork/pre-exec
+        for what, soft in plan:
+            try:
+                _, hard = resource.getrlimit(what)
+                # Never raise the hard cap; clamp the soft cap to it when the
+                # hard limit is finite and lower than what we asked for.
+                if hard != resource.RLIM_INFINITY and soft > hard:
+                    soft = hard
+                resource.setrlimit(what, (soft, hard))
+            except (ValueError, OSError):
+                # A limit the OS refuses (e.g. RLIMIT_NPROC quirks) is skipped
+                # rather than aborting the whole worker spawn.
+                pass
+
+    return _apply
+
+
 @dataclass
 class Observation:
     """The result of executing one cell."""
@@ -314,6 +368,10 @@ class Kernel:
                 env=env,
                 bufsize=1,
                 pass_fds=(result_w,),
+                # POSIX resource limits (RLIMIT_AS/FSIZE/CPU/NPROC). Runs in the
+                # child post-fork; None on Windows so we omit it there. Limits
+                # are inherited across the sandbox-exec re-exec when sandboxed.
+                preexec_fn=_make_rlimit_preexec(),
             )
         finally:
             # Parent side closes the write end; only child holds it.

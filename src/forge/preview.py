@@ -451,6 +451,7 @@ def Bash(*a, **kw): return _StubBashResult()
 def search(*a, **kw): return []
 def see(*a, **kw): return "(dry-run: see() skipped)"
 def find_skill(*a, **kw): return []
+def read_skill(*a, **kw): return "(dry-run: read_skill skipped)"
 def run_skill(*a, **kw): return None
 def call_mcp(*a, **kw): return None
 
@@ -460,6 +461,17 @@ def call_mcp(*a, **kw): return None
 sys.path.insert(0, os.environ.get("FORGE_SRC_PATH", ""))
 try:
     from forge.tools import Read as _real_Read, Write as _real_Write, Edit as _real_Edit
+    # read_document / resolve_path are READ-ONLY (reads are open in forge's
+    # model; only writes are overlay-guarded), so they run as the real
+    # functions in the dry-run — no wrapping needed. FileResolutionError is
+    # re-exported so cells that catch it don't NameError in the preview.
+    from forge.tools import (
+        read_document,
+        resolve_path,
+        FileResolutionError,
+        ProtectedPathError,
+        ProtectedActionError,
+    )
 
     def Read(path, **kw):
         _path_inside_overlay(path)
@@ -498,7 +510,12 @@ GLOBALS = {
     "__name__": "__forge_dryrun__",
     "Read": Read, "Write": Write, "Edit": Edit, "Bash": Bash,
     "search": search, "see": see,
-    "find_skill": find_skill, "run_skill": run_skill, "call_mcp": call_mcp,
+    "read_document": read_document, "resolve_path": resolve_path,
+    "FileResolutionError": FileResolutionError,
+    "ProtectedPathError": ProtectedPathError,
+    "ProtectedActionError": ProtectedActionError,
+    "find_skill": find_skill, "read_skill": read_skill,
+    "run_skill": run_skill, "call_mcp": call_mcp,
 }
 
 ok = True

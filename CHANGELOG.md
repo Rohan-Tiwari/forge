@@ -3,6 +3,194 @@
 All notable changes to Forge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — landscape gap-analysis wave 1
+
+Five features from the 2025–2026 agent-harness gap analysis
+([docs/LANDSCAPE-GAP-ANALYSIS.md](docs/LANDSCAPE-GAP-ANALYSIS.md)), chosen as
+the highest-impact, identity-preserving "if you only do five things" set. All
+are local-first, honesty-aligned, and mostly wire up plumbing that already
+existed. +41 tests (421 → 462).
+
+### Added
+
+- **Progressive-disclosure skills + LLM skill-search (gap B4; v10-inspired).**
+  The system prompt now carries only a skill **catalog** (name + one-line
+  description), never full bodies. A skill's complete `SKILL.md` is loaded on
+  demand via the new **`read_skill(name)`** tool — so context cost is paid only
+  for skills a task actually uses. `find_skill(query)` gained an **LLM ranker**
+  (new `skillsearch` router role, local/zero-cost) that matches by meaning when
+  the catalog is larger than 8 skills, falling back to token-overlap scoring
+  offline, on small catalogs, or if the model call fails. Mirrors the
+  agentskills.io progressive-disclosure pattern.
+
+- **Cross-session resume — `forge chat --continue` / `--resume <id>` (gap A6).**
+  Conversation state is persisted to `./.forge/sessions/<id>.json` after every
+  turn (the system prompt is deliberately NOT stored — it's rebuilt on resume so
+  prompt/skill changes take effect). `--continue`/`-c` restores the most recent
+  conversation in the workspace; `--resume <id>` restores a specific one. Honest
+  banner on resume: prior messages are replayed into context but **kernel
+  globals are fresh** — a resumed session does not rehydrate variables the agent
+  defined in cells. New `Session.resume_from()` / `_persist_state()`.
+
+- **`read_document()` and `resolve_path()` tool primitives.** The driver kept
+  hand-rolling fragile `Path(name).exists()` + `pdftotext` scaffolding in
+  throwaway cells — which broke on bare filenames living in `~/Downloads` and
+  swallowed failures without telling the user. These are now tested primitives
+  in the kernel scope:
+  - `resolve_path(path)` resolves a loosely-named path to an existing file,
+    trying the path as given, then (for bare names) cwd → `~/Downloads` →
+    `~/Desktop` → `~/Documents` → home. Raises `FileResolutionError` listing
+    every location searched, so a genuine miss is honest and debuggable.
+  - `read_document(path)` resolves the path, enforces the protected-path check
+    (same guarantee as `Read`), and extracts text by file type — PDFs via the
+    `pdftotext` CLI with a `pypdf` fallback, everything else as UTF-8. If no PDF
+    backend is available it raises an actionable error naming what to install;
+    an empty extraction from a real file raises rather than masking failure.
+
+- **Project/user instruction files — `FORGE.md` / `AGENTS.md` (gap A3).** The
+  agent now loads instruction files at session start: `FORGE_HOME/AGENTS.md`
+  (global) then each directory from the workspace root down to cwd, most
+  specific last. `AGENTS.md` is preferred (portable across the ecosystem);
+  `FORGE.md` is an accepted alias. Each file is folded into the system prompt
+  under a visible `[forge:project-instructions from <path>]` header so the
+  injection surface stays inspectable, byte-capped at
+  `FORGE_MAX_INSTRUCTION_BYTES` (16 KiB default). Loaded paths appear in the
+  `forge run` header and the `session.start` audit entry. See
+  `config.load_project_instructions()`.
+
+- **Self-consistency verification — `forge verify` (gap C2-lite).** A new
+  `forge.verify` module and `verify` CLI command re-ask a question *k* times
+  (default 3) at non-zero temperature via a new `verifier` role, then
+  majority-vote. Reports the consensus answer, an agreement ratio, and an
+  explicit **`unverified`** verdict when votes don't converge — nearly free
+  locally, and philosophically identical to forge's other honest failure
+  states. A pure function of the router: no subagent machinery. `router.complete`
+  gained an optional `temperature` parameter (default `0.0`, unchanged for all
+  existing callers).
+
+- **Kernel resource limits — `setrlimit` (gap D1).** The kernel worker is now
+  spawned with POSIX rlimits (`RLIMIT_AS`, `RLIMIT_FSIZE`, `RLIMIT_CPU`,
+  `RLIMIT_NPROC`) via a `preexec_fn`, configurable through `FORGE_MAX_*` env
+  vars / `config.toml` (0 disables a limit). Fulfils a long-standing SAFETY.md
+  promise: a fork bomb or `[0] * 10**12` can no longer wedge the host. POSIX
+  only — silently no-ops on Windows, like sandbox-exec off macOS. Documented
+  honestly: Darwin accepts but does **not** enforce `RLIMIT_AS`, so the
+  address-space cap is a Linux backstop; CPU/FSIZE/NPROC are enforced on both.
+
+- **Execution-based eval verification (gap I2) + LLM-as-judge (gap I1).** The
+  eval harness (`docs/eval/run.py`) can now measure the *post-state of the
+  world*, not just whether the loop ran. A dataset row may carry a `verify`
+  spec (`shell` / `python` / `audit_contains` / `audit_absent`) run in the
+  task's temp workspace after the agent finishes; `verify_passed` is recorded
+  per task and rolled up. Four rows (`edit-01`, `edit-03`, `safety-01`,
+  `safety-02`) now ship real assertions — the safety tasks finally verify the
+  boundary actually held and that secret bytes never leaked. Separately, the
+  formerly-NoOp `Judge` slot gained a real `ForgeRouterJudge` (I1): opt in with
+  `--judge local` (zero-cost gpt-oss) or `--judge <model>`; mean correctness is
+  reported alongside robustness.
+
+### Changed
+
+- **Driver system prompt: resourcefulness, path resolution, honest failure.**
+  Added three things to `system_prompt.md` to stop the model from giving up on
+  tasks it could do — and from failing silently. **"Be resourceful before
+  giving up"** instructs the driver to try stdlib, then the shell (`Bash` +
+  `shutil.which`), and to prefer the purpose-built helpers over hand-rolled
+  code — a skill is a convenience, not a precondition (an empty `find_skill(...)`
+  is not a stopping condition). **"Resolving paths the user gives you"** covers
+  loosely-named paths. **"Reporting when you can't do something"** requires the
+  driver to end in prose stating what it tried and the actual error, never
+  leaving a turn silent after a failed/empty cell. Worked Example 4 now
+  demonstrates `read_document(...)` plus honest failure reporting (kept generic
+  — no user-specific filenames). Complements the v0.2.4 anti-loop guidance:
+  don't over-retry a *finished* task, but don't under-try an *unattempted* one.
+
+- **Semantic history compaction replaces blind deletion (gaps A1+A2).**
+  `Session._maybe_truncate_history` now wires the previously-dead `summarizer`
+  role in a **two-tier escalation** (mirroring the v10 harness): **Tier 1** —
+  cheap, no model call — evicts old `Observation:` bodies (keeping recent turns
+  and the last error) until under a 25%-of-`num_ctx` target; **Tier 2** — only
+  if Tier 1 is insufficient — asks the local model to condense the middle span
+  into a single labelled `[forge:summary — model-generated, not verbatim]`
+  block preserving task, files modified, decisions, and unresolved errors. The
+  most recent traceback/`PostCheckFailed` is retained verbatim through both
+  tiers (A2). If the summarizer is unavailable (offline, cost ceiling), it
+  falls back to blind char-count deletion — compaction never blocks a turn.
+  Emits `history.compact` / `history.compact_failed` audit events.
+
+- **New router roles `verifier` and `skillsearch`** (gpt-oss:20b, medium/low
+  effort) added to the default role table, alongside the existing
+  driver/planner/vision/classifier/summarizer roles.
+
+### Fixed
+
+- **`resolve_path` hardening (found in stress testing).** (1) An empty or
+  whitespace-only path no longer silently resolves to the current directory —
+  it raises `FileResolutionError`. (2) `resolve_path` now REFUSES to locate
+  protected paths: resolving `~/.ssh/id_rsa` directly raises
+  `ProtectedPathError`, and the bare-name auto-search skips protected files
+  (e.g. a `credentials` or `.env` sitting in `~/Downloads`) rather than
+  surfacing a secret's location. `read_document`/`Read` already blocked
+  *reading* protected paths; this closes the weaker "help find it" gap too.
+
+- **Resume message count excluded the filtered system entry.** A persisted
+  `system` message is dropped on resume (so it can't inject a second system
+  prompt); the restored-count / banner now reports only the user+assistant
+  turns actually restored, not the raw file count.
+
+- **Confirm prompt was clobbered by the streaming region in chat mode.** In
+  `forge chat`, a cell with side effects (network/writes/Bash) raises an
+  approval prompt — but the whole turn runs inside a Rich `Live` streaming
+  region, so the prompt panel and its `y/n/a` input line were overwritten by
+  Live's refreshes. The turn looked hung when it was actually waiting on input
+  (e.g. "Fetch the weather in Berlin" → network cell → invisible prompt). The
+  streaming runner now exposes its `Live` region to the session, and
+  `InteractiveSession._confirm` pauses it (`live.stop()`) before showing the
+  prompt and resumes it (`live.start()`) after. No effect on one-shot `run` or
+  `--no-stream`.
+
+- **Sandbox blocked outbound to localhost — `see()`/vision and OCR were
+  unreachable under the sandbox.** The macOS `sandbox-exec` base profile
+  allowed `network-bind`/`network-inbound` for localhost (listening) but not
+  `network-outbound`, so any cell connecting to the local Ollama endpoint
+  (`localhost:11434`) failed with `Operation not permitted`. This silently
+  broke the `see()` vision helper and the PDF vision-OCR fallback whenever the
+  sandbox was on (the default) — e.g. reading a scanned PDF surfaced as an
+  empty/again-failed turn. Added `(allow network-outbound (remote ip
+  "localhost:*"))` to the base profile. Scoped to localhost only; non-loopback
+  outbound stays denied, so the exfiltration boundary is unchanged. Regression
+  test added in `test_sandbox.py`.
+
+- **`RLIMIT_NPROC` cap broke all subprocess spawning (regression in this
+  wave's D1).** The default `FORGE_MAX_PROCESSES=256` capped processes for the
+  entire UID, not the kernel's subtree — on a machine already running 600+
+  processes the worker couldn't fork at all, so `pdftotext`, shadow-git
+  commits, and every `Bash(...)` failed with `BlockingIOError: [Errno 35]`
+  (and PDF reads silently fell back to "no library installed"). `RLIMIT_NPROC`
+  is now **disabled by default** (there is no safe machine-independent value
+  for a per-UID limit); fork-bomb containment is left to the sandbox. The
+  CPU/FSIZE/AS limits are unaffected and still on.
+
+- **`read_document` now auto-installs `pypdf` when needed.** If `pdftotext`
+  isn't present and `pypdf` isn't importable, `read_document` transparently
+  `pip install`s it (current interpreter, quiet, bounded, best-effort) and
+  retries, rather than telling the user to install it themselves. Falls through
+  to a clear error only if the install also fails. Works wherever the kernel
+  has network; inside the network-denied sandbox the CLI/`pdftotext` path is
+  still primary.
+
+- **Dry-run preview `NameError` on new tools (globals drift).** The dry-run
+  overlay runs cells in a separate subprocess with its own hand-maintained
+  globals dict, independent of `kernel_globals()`. New tools added to the
+  kernel weren't mirrored there, so previewing a cell that called (e.g.)
+  `read_document(...)` failed with `NameError: name 'read_document' is not
+  defined` even though the real run would have worked. The dry-run driver now
+  exposes `read_document`/`resolve_path` (real, read-only) and the re-exported
+  `FileResolutionError`/`ProtectedPathError`/`ProtectedActionError`. A new
+  `TestKernelDryRunParity` suite asserts every callable in `kernel_globals()`
+  is present in the dry-run driver, so the two global sets can never silently
+  drift again.
+
 ## [0.2.4] — 2026-06-26 — stop looping on null results
 
 ### Fixed

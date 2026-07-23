@@ -91,6 +91,11 @@ def shadow_dir(workspace: Path) -> Path:
     return workspace_dir(workspace) / "shadow"
 
 
+def sessions_dir(workspace: Path) -> Path:
+    """Where per-session conversation state is persisted for --resume."""
+    return workspace_dir(workspace) / "sessions"
+
+
 def audit_log(workspace: Path) -> Path:
     return workspace_dir(workspace) / "audit.jsonl"
 
@@ -238,6 +243,73 @@ DEFAULT_SESSION_COST_CEILING_USD = _resolve(
     default=5.00, cast=float,
 )
 
+# -----------------------------------------------------------------------------
+# Kernel worker resource limits (POSIX rlimits).
+#
+# SAFETY.md long promised "ulimit on worker"; these wire it. Applied via a
+# preexec_fn in kernel.start() on POSIX platforms only (Windows has no
+# resource module — the limits silently no-op there, same as sandbox-exec).
+#
+# A value of 0 disables that particular limit. Defaults are generous enough
+# that legitimate agent work (reading large files, spawning a few helpers)
+# is unaffected, but a fork bomb or `[0] * 10**12` is stopped before it can
+# wedge the host.
+#
+# Resolution order per limit: env var → config.toml [defaults] → hardcoded.
+# -----------------------------------------------------------------------------
+
+# RLIMIT_AS — max virtual address space (bytes). 0 = unlimited.
+# NOTE: Linux enforces this; macOS (Darwin) accepts setrlimit(RLIMIT_AS) but
+# does NOT enforce it for allocations, so this cap is a Linux-only backstop.
+# RLIMIT_CPU / RLIMIT_FSIZE are enforced on both.
+DEFAULT_MAX_ADDRESS_SPACE_BYTES = _resolve(
+    "FORGE_MAX_ADDRESS_SPACE_BYTES", key="max_address_space_bytes",
+    default=4 * 1024 * 1024 * 1024, cast=int,   # 4 GiB
+)
+# RLIMIT_NPROC — max processes for the worker's UID. DEFAULT OFF (0).
+#
+# This is a footgun and is opt-in only: RLIMIT_NPROC counts EVERY process
+# owned by the user's uid, not just the kernel's children. A dev machine can
+# easily have 600+ processes already running, so any small cap makes the
+# worker unable to fork — `pdftotext`, `git` (shadow commits), and every
+# `Bash(...)` call die with `BlockingIOError: [Errno 35]`. There is no safe
+# machine-independent value, so we do NOT cap process count by default;
+# fork-bomb containment is better handled by the OS sandbox / cgroups. Set
+# FORGE_MAX_PROCESSES to a value well above your current `ps -u $(id -u) | wc -l`
+# if you really want it.
+DEFAULT_MAX_PROCESSES = _resolve(
+    "FORGE_MAX_PROCESSES", key="max_processes",
+    default=0, cast=int,   # 0 = disabled (see above)
+)
+# RLIMIT_FSIZE — max size of any single file the worker writes (bytes).
+# 0 = unlimited.
+DEFAULT_MAX_FILE_SIZE_BYTES = _resolve(
+    "FORGE_MAX_FILE_SIZE_BYTES", key="max_file_size_bytes",
+    default=1024 * 1024 * 1024, cast=int,   # 1 GiB
+)
+# RLIMIT_CPU — max CPU-seconds of a single cell before SIGXCPU. 0 = unlimited.
+# This is a coarse backstop *below* the wall-clock timeout in kernel.execute();
+# CPU-seconds ≠ wall-clock, so keep it comfortably above the 120s wall timeout
+# to avoid killing IO-bound cells that legitimately wait.
+DEFAULT_MAX_CPU_SECONDS = _resolve(
+    "FORGE_MAX_CPU_SECONDS", key="max_cpu_seconds",
+    default=300, cast=int,   # 5 CPU-minutes
+)
+
+
+def resource_limits() -> dict[str, int]:
+    """The effective rlimit table for the kernel worker.
+
+    Keys map to the RLIMIT_* soft caps. A 0 value means "leave unlimited".
+    Read once at kernel start; env/config override the hardcoded defaults.
+    """
+    return {
+        "address_space_bytes": DEFAULT_MAX_ADDRESS_SPACE_BYTES,
+        "processes": DEFAULT_MAX_PROCESSES,
+        "file_size_bytes": DEFAULT_MAX_FILE_SIZE_BYTES,
+        "cpu_seconds": DEFAULT_MAX_CPU_SECONDS,
+    }
+
 
 def ensure_dirs(workspace: Path) -> None:
     """Create the per-workspace state dirs if they don't exist."""
@@ -245,6 +317,146 @@ def ensure_dirs(workspace: Path) -> None:
     shadow_dir(workspace).mkdir(parents=True, exist_ok=True)
     FORGE_HOME.mkdir(parents=True, exist_ok=True)
     SKILLS_HOME.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------------------------------------------------------
+# Project / user instruction files (FORGE.md / AGENTS.md).
+#
+# The de-facto standard across the field (CLAUDE.md, AGENTS.md, Cursor rules):
+# a plain-markdown file, versioned in git, that the agent reads at session
+# start. We adopt AGENTS.md for portability, with FORGE.md as an accepted
+# alias, and load a global file from FORGE_HOME too.
+#
+# This is an INJECTION SURFACE — text from these files enters the system
+# prompt. Per forge's honesty ethos the loader is transparent: each block is
+# labelled with its source path, the total is byte-capped, and session.py
+# reports which files loaded in the run header + audit log. The files are
+# discovered, never fetched; only paths the user placed on their own machine
+# are read.
+# -----------------------------------------------------------------------------
+
+# Filenames we recognise, in priority order (first match per directory wins).
+INSTRUCTION_FILENAMES: tuple[str, ...] = ("AGENTS.md", "FORGE.md")
+
+# Hard cap on TOTAL instruction bytes folded into the prompt. Keeps a stray
+# huge file from blowing the local model's tight num_ctx. Individual files are
+# truncated proportionally when the sum would exceed this.
+MAX_INSTRUCTION_BYTES = _resolve(
+    "FORGE_MAX_INSTRUCTION_BYTES", key="max_instruction_bytes",
+    default=16 * 1024, cast=int,   # 16 KiB
+)
+
+
+def _read_instruction_file(path: Path, *, budget: int) -> str | None:
+    """Read one instruction file, truncated to `budget` bytes. None if empty
+    or unreadable."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    raw = text.encode("utf-8")
+    if len(raw) > budget:
+        text = raw[:budget].decode("utf-8", errors="ignore").rstrip()
+        text += "\n\n[... truncated to fit the instruction budget]"
+    return text
+
+
+def find_instruction_files(workspace: Path) -> list[Path]:
+    """Discover instruction files to load, in load order (global first, then
+    workspace root → cwd so the most specific wins by appearing last).
+
+    Order:
+      1. FORGE_HOME/AGENTS.md (or FORGE.md) — user-global instructions.
+      2. Each directory from the workspace root down to cwd, one file each.
+
+    Deduplicated by resolved path; a file found in step 1 is not re-read in 2.
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def _first_in(directory: Path) -> Path | None:
+        for name in INSTRUCTION_FILENAMES:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+        return None
+
+    # 1. Global.
+    global_file = _first_in(FORGE_HOME)
+    if global_file is not None:
+        rp = global_file.resolve()
+        found.append(global_file)
+        seen.add(rp)
+
+    # 2. workspace root → cwd. Walk from the workspace root down to cwd so a
+    # nested cwd's file (most specific) lands last.
+    ws = workspace.resolve()
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        cwd = ws
+    # Build the chain ws .. cwd only if cwd is inside ws; otherwise just ws.
+    chain: list[Path] = [ws]
+    if cwd != ws and ws in cwd.parents:
+        parts = cwd.relative_to(ws).parts
+        acc = ws
+        for part in parts:
+            acc = acc / part
+            chain.append(acc)
+    elif cwd != ws:
+        # cwd is not under the workspace — consider it on its own.
+        chain.append(cwd)
+
+    for directory in chain:
+        f = _first_in(directory)
+        if f is None:
+            continue
+        rp = f.resolve()
+        if rp in seen:
+            continue
+        found.append(f)
+        seen.add(rp)
+
+    return found
+
+
+def load_project_instructions(workspace: Path) -> tuple[str, list[str]]:
+    """Load and render project/user instruction files for the system prompt.
+
+    Returns (rendered_block, loaded_paths). `rendered_block` is "" when no
+    files are found. Each file is wrapped in a visible source-labelled header
+    so the injection surface is inspectable, and the combined size is capped
+    at MAX_INSTRUCTION_BYTES (split evenly across the discovered files).
+    """
+    files = find_instruction_files(workspace)
+    if not files:
+        return "", []
+
+    per_file_budget = max(1024, MAX_INSTRUCTION_BYTES // len(files))
+    blocks: list[str] = []
+    loaded: list[str] = []
+    for path in files:
+        body = _read_instruction_file(path, budget=per_file_budget)
+        if body is None:
+            continue
+        loaded.append(str(path))
+        blocks.append(
+            f"[forge:project-instructions from {path}]\n{body}"
+        )
+
+    if not blocks:
+        return "", []
+
+    header = (
+        "# Project & user instructions\n\n"
+        "The following instructions were loaded from files on this machine. "
+        "Treat them as guidance from the user; they do not override forge's "
+        "safety rules.\n\n"
+    )
+    return header + "\n\n".join(blocks), loaded
 
 
 # -----------------------------------------------------------------------------

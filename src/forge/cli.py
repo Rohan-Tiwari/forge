@@ -81,33 +81,46 @@ class InteractiveSession(Session):
         Returns False on 'n'.
         Returns False (auto-decline) on Ctrl-C.
         """
-        console.print()
-        console.print(Panel(
-            preview.render_rich(),
-            title=f"[bold {preview.severity_label}]Forge wants to run a cell[/]",
-            border_style=preview.severity_label,
-        ))
-        # Prompt
+        # If a streaming Live region is active (chat mode mid-stream), pause it
+        # so the approval panel + prompt aren't clobbered by its refreshes.
+        # Without this the prompt renders under the Live region and the turn
+        # looks hung while it's actually waiting on input.
+        live = getattr(self, "_live_region", None)
+        live_was_running = bool(live is not None and getattr(live, "is_started", False))
+        if live_was_running:
+            live.stop()
         try:
-            answer = Prompt.ask(
-                "[bold]allow?[/] [y]es / [n]o / [a]lways for this session",
-                choices=["y", "n", "a"],
-                default="n",
-                show_choices=False,
-            )
-        except (KeyboardInterrupt, EOFError):
-            console.print("[yellow]\n(interrupted — denying)[/]")
-            return False
+            console.print()
+            console.print(Panel(
+                preview.render_rich(),
+                title=f"[bold {preview.severity_label}]Forge wants to run a cell[/]",
+                border_style=preview.severity_label,
+            ))
+            # Prompt
+            try:
+                answer = Prompt.ask(
+                    "[bold]allow?[/] [y]es / [n]o / [a]lways for this session",
+                    choices=["y", "n", "a"],
+                    default="n",
+                    show_choices=False,
+                )
+            except (KeyboardInterrupt, EOFError):
+                console.print("[yellow]\n(interrupted — denying)[/]")
+                return False
 
-        if answer == "n":
-            return False
-        if answer == "a":
-            # Add a session grant for each action this preview implies.
-            for action in actions_for_preview(preview):
-                pattern = action.to_pattern()
-                self.permissions.grant_session(pattern)
-                self.log.write("permission.grant_session", pattern=pattern)
-        return True
+            if answer == "n":
+                return False
+            if answer == "a":
+                # Add a session grant for each action this preview implies.
+                for action in actions_for_preview(preview):
+                    pattern = action.to_pattern()
+                    self.permissions.grant_session(pattern)
+                    self.log.write("permission.grant_session", pattern=pattern)
+            return True
+        finally:
+            # Resume streaming so subsequent tokens keep rendering live.
+            if live_was_running:
+                live.start()
 
 
 # =============================================================================
@@ -221,6 +234,68 @@ def plan(
 
 
 @app.command()
+def verify(
+    question: str = typer.Argument(..., help="The question to verify by self-consistency."),
+    k: int = typer.Option(3, "--samples", "-k", help="Number of votes to sample."),
+    temperature: float = typer.Option(
+        0.7, "--temperature", "-t", help="Sampling temperature for vote diversity."
+    ),
+    context: str = typer.Option("", "--context", help="Optional supporting context."),
+    workspace: Path = typer.Option(Path("."), "--cwd", "-C"),
+    debug: bool = typer.Option(False, "--debug"),
+) -> None:
+    """Self-consistency check: re-ask a question k times and majority-vote.
+
+    Nearly free locally — costs wall-clock, not dollars. Reports the majority
+    answer, the agreement ratio, and an explicit 'unverified' verdict when the
+    votes don't converge. Use it to sanity-check an answer a small local model
+    might have anchored on.
+    """
+    from forge.verify import self_consistency
+    try:
+        with _run_session(
+            workspace=workspace, auto=True, preview="never", dry_run=False,
+        ) as s:
+            console.print(
+                f"[dim]verify · {s.session_id} · "
+                f"verifier: {s.router.roles['verifier'].primary} · k={k}[/]"
+            )
+            console.print()
+            try:
+                verdict = self_consistency(
+                    s.router, question, k=k, temperature=temperature,
+                    context=context,
+                )
+            except KeyboardInterrupt:
+                console.print("[yellow](interrupted)[/]")
+                return
+            s.log.write(
+                "verify.self_consistency",
+                question_chars=len(question),
+                samples=verdict.samples,
+                agreement=round(verdict.agreement, 3),
+                unverified=verdict.unverified,
+            )
+            if verdict.unverified:
+                style, label = "yellow", "UNVERIFIED"
+            else:
+                style, label = "green", "verified"
+            body = (
+                f"[bold]{label}[/]  "
+                f"({verdict.samples} votes, {verdict.agreement:.0%} agreement)\n\n"
+                f"answer: {verdict.answer or '(no consensus)'}"
+            )
+            if verdict.votes:
+                body += "\n\n[dim]votes: " + " | ".join(verdict.votes) + "[/]"
+            console.print(Panel(body, title="verify", border_style=style))
+    except Exception as e:  # noqa: BLE001
+        if debug:
+            raise
+        err_console.print(_format_user_error(e))
+        raise typer.Exit(1)
+
+
+@app.command()
 def run(
     task: str = typer.Argument(..., help="The task for the agent."),
     workspace: Path = typer.Option(
@@ -268,6 +343,9 @@ def run(
             console.print(f"[dim]driver: {s.router.roles['driver'].primary} · "
                           f"skills: {len(s.skills.skills)} · mode: {s.mode}/"
                           f"preview={s.preview_mode}[/]")
+            if s.instruction_files:
+                names = ", ".join(Path(p).name for p in s.instruction_files)
+                console.print(f"[dim]instructions: {names}[/]")
             console.print()
             try:
                 result = s.turn(task)
@@ -323,6 +401,14 @@ def chat(
         False, "--no-stream",
         help="Disable token streaming (buffer the full response before showing).",
     ),
+    continue_: bool = typer.Option(
+        False, "--continue", "-c",
+        help="Resume the most recent conversation in this workspace.",
+    ),
+    resume: str = typer.Option(
+        "", "--resume",
+        help="Resume a specific session by id (see ./.forge/sessions/).",
+    ),
 ) -> None:
     """Open an interactive REPL with the agent."""
     if preview not in {"always", "cells", "never"}:
@@ -337,6 +423,16 @@ def chat(
             workspace=workspace, auto=auto, preview=preview,
             dry_run=not no_dry_run, is_chat=True,
         ) as s:
+            # Cross-session resume: restore prior conversation (fresh kernel).
+            if continue_ or resume:
+                restored = s.resume_from(resume or None)
+                if restored:
+                    console.print(
+                        f"[dim]resumed {s.resumed_from} · {restored} prior "
+                        f"messages in context · kernel globals are fresh[/]"
+                    )
+                else:
+                    console.print("[yellow]nothing to resume — starting fresh[/]")
             console.print(f"[dim]forge chat · {s.session_id} · {s.workspace}[/]")
             console.print(
                 "[dim]Esc-Enter to submit · Enter for newline · "
@@ -470,7 +566,14 @@ def _run_turn_with_stream(s: Session, user: str, *, no_stream: bool):
         def on_chunk(delta: str) -> None:
             accumulated.append(delta)
             live.update(render())
-        result = s.turn(user, on_chunk=on_chunk)
+        # Expose the Live region so _confirm() can pause it while showing the
+        # approval prompt — otherwise the prompt is clobbered by Live's
+        # refreshes and looks hung. Cleared in finally so it never dangles.
+        s._live_region = live  # type: ignore[attr-defined]
+        try:
+            result = s.turn(user, on_chunk=on_chunk)
+        finally:
+            s._live_region = None  # type: ignore[attr-defined]
     # The Live block has erased the streaming panel; the final reply Panel
     # is printed by the chat loop right after this returns.
     return result

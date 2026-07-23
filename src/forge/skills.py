@@ -7,13 +7,21 @@ A skill is a folder containing:
     scripts/          — optional, AST-scanned at install time
     assets/           — optional data files
 
-The registry has two tiers:
-    Tier 1 (eager) — every skill's name+description injected into the system
-                     prompt at session start, capped at 5k tokens. The model
-                     sees them all and can pick by name.
-    Tier 2 (lazy)  — for catalogs of >50 skills, find_skill(query) does a
-                     semantic search by description. v0 ships a stub that
-                     does substring matching; v1 swaps in a real embedder.
+Progressive disclosure (the [agentskills.io](https://agentskills.io/) pattern,
+mirroring the v10 harness's skill-resolution):
+
+    Catalog (always) — every skill's name + one-line description is injected
+                       into the system prompt at session start, byte-capped.
+                       This is cheap: enough for the model to know what's on
+                       hand without paying the full-text context cost.
+    Full text (lazy) — a skill's complete SKILL.md body is loaded ONLY when
+                       selected, via `read_skill(name)`. The agent can also
+                       search mid-task with `find_skill(query)`.
+
+Skill search (`find`) ranks the catalog against a query. It uses an LLM ranker
+(the `skillsearch` router role) when a router is wired — matching by meaning,
+not keywords — and falls back to token-overlap scoring offline or when the
+catalog is small.
 """
 from __future__ import annotations
 
@@ -174,6 +182,12 @@ def discover_skills(roots: list[Path] | None = None) -> list[Skill]:
 class SkillRegistry:
     skills: list[Skill] = field(default_factory=list)
     eager_token_cap: int = 5000
+    # Optional ModelRouter for LLM-based skill ranking. When None, find()
+    # falls back to token-overlap scoring. Wired by Session.start().
+    router: Any = None
+    # Catalogs at or below this size skip the LLM ranker entirely (overlap
+    # scoring is fine and free for a handful of skills).
+    llm_search_threshold: int = 8
 
     @classmethod
     def scan(cls, roots: list[Path] | None = None) -> SkillRegistry:
@@ -185,18 +199,36 @@ class SkillRegistry:
                 return s
         return None
 
+    def read_full(self, name: str) -> str | None:
+        """Progressive disclosure: return a skill's FULL SKILL.md body on
+        demand. Returns None if no such skill. This is what `read_skill(name)`
+        calls — the catalog carries only descriptions, so the full text is
+        paid for in context only when a task actually selects the skill.
+        """
+        s = self.get(name)
+        if s is None:
+            return None
+        return s.body
+
     def render_for_system_prompt(self) -> str:
-        """Tier 1 — eager metadata, capped at `eager_token_cap` chars (~tokens)."""
+        """Catalog — eager metadata (name + description) only, never full
+        bodies. Byte-capped at `eager_token_cap` (~chars*4). Tells the model
+        to `read_skill(name)` for a skill's full instructions and
+        `find_skill(query)` to search by meaning.
+        """
         if not self.skills:
             return ""
-        lines = ["## Available skills", "",
-                 "Use `find_skill(query)` for ones not listed here.", ""]
+        lines = ["## Available skills (catalog)", "",
+                 "These are the skills installed on this machine — names and "
+                 "one-line descriptions only. Call `read_skill(name)` to load a "
+                 "skill's full instructions when you decide to use it, or "
+                 "`find_skill(query)` to search by meaning.", ""]
         used = sum(len(line) for line in lines)
-        for s in self.skills:
+        for i, s in enumerate(self.skills):
             line = s.render_summary()
             # Naive char-as-tokens estimate. Conservative — tokens are ~4 chars.
             if used + len(line) > self.eager_token_cap * 4:
-                lines.append(f"- ... and {len(self.skills) - len(lines) + 4} more "
+                lines.append(f"- ... and {len(self.skills) - i} more "
                              f"(use find_skill())")
                 break
             lines.append(line)
@@ -204,10 +236,28 @@ class SkillRegistry:
         return "\n".join(lines)
 
     def find(self, query: str, *, top_k: int = 5) -> list[dict[str, Any]]:
-        """Tier 2 — substring + token overlap search.
+        """Search the catalog for skills relevant to `query`.
 
-        v0 keeps it simple. Replace with embeddings + cosine sim for v1.
+        Uses the LLM ranker (via the `skillsearch` router role) when a router
+        is wired AND the catalog is larger than `llm_search_threshold` —
+        matching by meaning so an oddly-phrased request still finds the right
+        skill. Falls back to token-overlap scoring when there's no router, the
+        catalog is small, or the LLM call fails. Always returns
+        [{name, description, score}] ranked best-first.
         """
+        if not self.skills:
+            return []
+        if self.router is not None and len(self.skills) > self.llm_search_threshold:
+            try:
+                ranked = self._find_llm(query, top_k=top_k)
+                if ranked:
+                    return ranked
+            except Exception:  # noqa: BLE001 — never let ranking break a tool call
+                pass  # fall through to overlap scoring
+        return self._find_overlap(query, top_k=top_k)
+
+    def _find_overlap(self, query: str, *, top_k: int) -> list[dict[str, Any]]:
+        """Token-overlap fallback ranker (no model needed)."""
         q_terms = {t.lower() for t in re.findall(r"\w+", query) if len(t) > 2}
         if not q_terms:
             return []
@@ -227,4 +277,40 @@ class SkillRegistry:
         return [
             {"name": s.name, "description": s.description, "score": float(score)}
             for score, s in scored[:top_k]
+        ]
+
+    def _find_llm(self, query: str, *, top_k: int) -> list[dict[str, Any]]:
+        """LLM ranker — ask the `skillsearch` role to pick the relevant skills
+        by meaning. Returns [] if the model names nothing usable (caller then
+        falls back to overlap). Raises on transport errors (caught by find()).
+        """
+        catalog = "\n".join(
+            f"- {s.name}: {s.description}" for s in self.skills
+        )
+        system = (
+            "You match a user request to the most relevant skills from a "
+            "catalog. Return ONLY the names of skills that genuinely fit, most "
+            "relevant first, one per line. If none fit, return nothing. Do not "
+            "invent names — copy them exactly from the catalog."
+        )
+        user = f"Request:\n{query}\n\nSkill catalog:\n{catalog}"
+        completion = self.router.complete(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            role="skillsearch",
+        )
+        # Parse names from the response; keep only real catalog entries, in the
+        # model's order, deduplicated.
+        by_name = {s.name: s for s in self.skills}
+        picked: list[Skill] = []
+        seen: set[str] = set()
+        for raw in completion.content.splitlines():
+            token = raw.strip().lstrip("-*0123456789. ").strip("`\"' ")
+            if token in by_name and token not in seen:
+                seen.add(token)
+                picked.append(by_name[token])
+        return [
+            {"name": s.name, "description": s.description,
+             "score": float(len(picked) - i)}
+            for i, s in enumerate(picked[:top_k])
         ]

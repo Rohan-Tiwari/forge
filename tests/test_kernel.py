@@ -76,3 +76,83 @@ def test_kernel_survives_many_cells(kernel):
         obs = kernel.execute(f"print({i})")
         assert obs.ok
     assert kernel.health.cells_executed == 20
+
+
+# ---- D1: resource limits (setrlimit preexec) --------------------------------
+
+
+def test_rlimit_preexec_builder_returns_callable_or_none():
+    """On POSIX with a rlimit plan, _make_rlimit_preexec returns a callable;
+    on a platform without `resource` it returns None. Either is valid."""
+    from forge.kernel import _make_rlimit_preexec
+    fn = _make_rlimit_preexec()
+    assert fn is None or callable(fn)
+
+
+def test_rlimit_preexec_none_when_all_limits_disabled(monkeypatch):
+    """Setting every limit to 0 disables rlimits → builder returns None."""
+    import importlib
+
+    import forge.config as config
+    for var, val in (
+        ("FORGE_MAX_ADDRESS_SPACE_BYTES", "0"),
+        ("FORGE_MAX_PROCESSES", "0"),
+        ("FORGE_MAX_FILE_SIZE_BYTES", "0"),
+        ("FORGE_MAX_CPU_SECONDS", "0"),
+    ):
+        monkeypatch.setenv(var, val)
+    importlib.reload(config)
+    try:
+        from forge.kernel import _make_rlimit_preexec
+        # On POSIX this should be None (empty plan); on Windows also None.
+        assert _make_rlimit_preexec() is None
+    finally:
+        # Revert env, then reload so later tests see defaults again.
+        for var in ("FORGE_MAX_ADDRESS_SPACE_BYTES", "FORGE_MAX_PROCESSES",
+                    "FORGE_MAX_FILE_SIZE_BYTES", "FORGE_MAX_CPU_SECONDS"):
+            monkeypatch.delenv(var, raising=False)
+        importlib.reload(config)
+
+
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="rlimits are POSIX-only",
+)
+def test_rlimit_is_applied_in_worker(tmp_path, monkeypatch):
+    """The preexec_fn actually sets the configured soft limits in the worker.
+
+    We assert on what forge CONTROLS — that setrlimit ran in the child — not
+    on kernel enforcement, which varies by platform (notably, Darwin does not
+    enforce RLIMIT_AS even when it is set; Linux does). The cell reads its own
+    rlimits back via the stdlib `resource` module.
+
+    We deliberately test CPU + FSIZE, NOT NPROC: RLIMIT_NPROC is per-uid and
+    capping it can stop the worker itself from forking on a busy machine (the
+    exact footgun that broke pdftotext), so it's disabled by default and not
+    exercised here.
+    """
+    import importlib
+
+    import forge.config as config
+    monkeypatch.setenv("FORGE_MAX_CPU_SECONDS", "222")
+    monkeypatch.setenv("FORGE_MAX_FILE_SIZE_BYTES", str(123 * 1024 * 1024))
+    importlib.reload(config)
+    try:
+        from forge.kernel import Kernel
+        k = Kernel(workspace=tmp_path, sandboxed=False)
+        k.start()
+        try:
+            obs = k.execute(
+                "import resource\n"
+                "print('CPU', resource.getrlimit(resource.RLIMIT_CPU)[0])\n"
+                "print('FSIZE', resource.getrlimit(resource.RLIMIT_FSIZE)[0])\n"
+            )
+            assert obs.ok, obs.stderr
+            assert "CPU 222" in obs.stdout
+            assert f"FSIZE {123 * 1024 * 1024}" in obs.stdout
+        finally:
+            k.stop()
+    finally:
+        monkeypatch.delenv("FORGE_MAX_CPU_SECONDS", raising=False)
+        monkeypatch.delenv("FORGE_MAX_FILE_SIZE_BYTES", raising=False)
+        importlib.reload(config)

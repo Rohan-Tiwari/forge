@@ -61,6 +61,17 @@ class TestBuildProfile:
         # No catch-all outbound allow
         assert "(allow network-outbound)" not in prof
 
+    def test_profile_allows_localhost_outbound(self, tmp_path):
+        """Regression: the sandbox MUST allow outbound to localhost or the
+        agent can't reach the local Ollama/vision model — see()/OCR and any
+        local-model tool fail with 'Operation not permitted'. This is scoped
+        to localhost only; non-loopback outbound stays denied.
+        """
+        prof = build_profile(workspace=tmp_path, allowed_network_hosts=None)
+        assert '(allow network-outbound (remote ip "localhost:*"))' in prof
+        # Still no catch-all outbound (the localhost rule is argument-scoped).
+        assert "(allow network-outbound)" not in prof
+
     def test_profile_with_allowlist_does_NOT_open_outbound(self, tmp_path):
         """Regression for v0.2.1 audit finding #1.
 

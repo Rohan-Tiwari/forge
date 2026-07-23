@@ -7,6 +7,8 @@ Five named roles, each with a primary model and an escalation chain:
     vision      — see() sub-skill. Default: qwen2.5vl on Ollama.
     classifier  — auto-mode safety check. Default: gpt-oss:20b at low effort.
     summarizer  — context truncation. Default: gpt-oss:20b at low effort.
+    verifier    — self-consistency / critic checks. Default: gpt-oss:20b at medium effort.
+    skillsearch — LLM skill ranking. Default: gpt-oss:20b at low effort.
 
 The router itself is a thin orchestrator over a CHAIN OF PROVIDERS
 (see forge.providers). Each provider knows how to talk to one backend
@@ -106,6 +108,8 @@ def default_roles() -> dict[str, RoleConfig]:
         ),
         "classifier": RoleConfig(primary=DEFAULT_DRIVER_MODEL, effort="low"),
         "summarizer": RoleConfig(primary=DEFAULT_DRIVER_MODEL, effort="low"),
+        "verifier": RoleConfig(primary=DEFAULT_DRIVER_MODEL, effort="medium"),
+        "skillsearch": RoleConfig(primary=DEFAULT_DRIVER_MODEL, effort="low"),
         "planner": RoleConfig(primary=planner_primary, effort="high"),
         "vision": RoleConfig(primary="qwen2.5vl:7b"),
     }
@@ -265,11 +269,16 @@ class ModelRouter:
         *,
         role: str = "driver",
         max_tokens: int = 2048,
+        temperature: float = 0.0,
     ) -> Completion:
         """Make a model call for the given role.
 
         Walks the escalation chain on provider errors (network, 5xx, parse
         errors). Cost ceiling is enforced before the call.
+
+        `temperature` defaults to 0.0 (deterministic — the driver/planner
+        default). Callers that need sampling diversity (e.g. self-consistency
+        voting in forge.verify) pass a higher value.
         """
         if self.spent_usd >= self.cost_ceiling_usd:
             raise CostCeilingExceeded(
@@ -289,7 +298,7 @@ class ModelRouter:
                     model=model,
                     messages=messages,
                     max_tokens=max_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     effort=cfg.effort,
                     num_ctx=cfg.num_ctx,
                     role=role,
