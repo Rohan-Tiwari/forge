@@ -13,7 +13,7 @@ existed. +41 tests (421 → 462).
 
 ### Added
 
-- **Progressive-disclosure skills + LLM skill-search (gap B4; v10-inspired).**
+- **Progressive-disclosure skills + LLM skill-search (gap B4).**
   The system prompt now carries only a skill **catalog** (name + one-line
   description), never full bodies. A skill's complete `SKILL.md` is loaded on
   demand via the new **`read_skill(name)`** tool — so context cost is paid only
@@ -107,7 +107,7 @@ existed. +41 tests (421 → 462).
 
 - **Semantic history compaction replaces blind deletion (gaps A1+A2).**
   `Session._maybe_truncate_history` now wires the previously-dead `summarizer`
-  role in a **two-tier escalation** (mirroring the v10 harness): **Tier 1** —
+  role in a **two-tier escalation**: **Tier 1** —
   cheap, no model call — evicts old `Observation:` bodies (keeping recent turns
   and the last error) until under a 25%-of-`num_ctx` target; **Tier 2** — only
   if Tier 1 is insufficient — asks the local model to condense the middle span
