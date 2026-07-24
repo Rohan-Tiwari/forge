@@ -4,11 +4,11 @@
 [![Release](https://img.shields.io/github/v/release/Rohan-Tiwari/forge?label=release)](https://github.com/Rohan-Tiwari/forge/releases/latest)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-421%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-508%20passing-brightgreen)](tests/)
 
 > A code-first local agent. Emits Python into a persistent kernel instead of JSON tool calls, runs entirely on your machine against `gpt-oss:20b` via Ollama, and treats your filesystem as a first-class object — with sandbox-exec, dry-run previews, git-based undo, and a real safety story.
 
-**Status: v0.2.4** · 421 tests passing on macOS + Linux × Python 3.11/3.12/3.13.
+**Status: v0.2.4 released · `main` ahead with wave-1 features (unreleased).** 508 tests passing on macOS + Linux × Python 3.11/3.12/3.13.
 
 ---
 
@@ -18,17 +18,18 @@
 2. [What it can do](#what-it-can-do)
 3. [Install](#install)
 4. [First run](#first-run)
-5. [Commands](#commands)
-6. [Architecture](#architecture)
-7. [Safety model](#safety-model)
-8. [Configuration](#configuration)
-9. [Writing skills](#writing-skills)
-10. [Daemon mode](#daemon-mode)
-11. [Development & testing](#development--testing)
-12. [Releases](#releases)
-13. [Roadmap & status](#roadmap--status)
-14. [Contributing](#contributing)
-15. [License](#license)
+5. [Try it — test utterances](#try-it--test-utterances)
+6. [Commands](#commands)
+7. [Architecture](#architecture)
+8. [Safety model](#safety-model)
+9. [Configuration](#configuration)
+10. [Writing skills](#writing-skills)
+11. [Daemon mode](#daemon-mode)
+12. [Development & testing](#development--testing)
+13. [Releases](#releases)
+14. [Roadmap & status](#roadmap--status)
+15. [Contributing](#contributing)
+16. [License](#license)
 
 ---
 
@@ -52,13 +53,18 @@ Three properties make Forge different from a chat wrapper around a local model:
 |---|---|
 | 🧠 **Local-first reasoning** | Drives `gpt-oss:20b` via Ollama by default. Zero per-call cost. |
 | 🪜 **Multi-provider escalation** | Optional chain to Claude / GPT-5 when local model fails twice on format or intent. Detected from env vars; no config needed. |
-| 👁️ **Vision** | `see(image)` reads any image via local Qwen2.5-VL. |
+| 👁️ **Vision + document reading** | `see(image)` reads any image via local Qwen2.5-VL. `read_document(path)` extracts text from PDFs (pdftotext → pypdf → vision-OCR) and any text file, resolving loosely-named paths. |
 | 🌊 **Streaming chat** | Token-by-token rendering, multi-line input, slash commands, persistent history. |
+| 🧭 **Project instructions** | Drops an `AGENTS.md` / `FORGE.md` in your workspace (or `~/.forge/`) into the system prompt under a visible header — versioned, inspectable guidance. |
+| 🧵 **Cross-session resume** | `forge chat --continue` / `--resume <id>` restores a prior conversation (fresh kernel, honest banner). |
+| 🗜️ **Semantic compaction** | Long sessions compact in two tiers — evict old tool output first, then a labelled model summary — instead of blind deletion. |
+| ✅ **Self-consistency verify** | `forge verify` re-asks a question k times and majority-votes, with an explicit `unverified` verdict. Free locally. |
 | 🪞 **Real dry-run previews** | The next cell executes in an overlay filesystem; you see the real diff before approving the real run. |
-| 🪪 **macOS sandbox** | `sandbox-exec` profile restricts writes to the workspace + `~/.forge` + tmp; reads are open, network is denied by default. |
+| 🪪 **macOS sandbox** | `sandbox-exec` profile restricts writes to the workspace + `~/.forge` + tmp; reads are open; outbound network is localhost-only. |
+| 🚧 **Resource limits** | Kernel worker runs under POSIX rlimits (CPU, address space, file size) so a runaway cell can't wedge the host. |
 | 🔌 **MCP integration** | `call_mcp(server, tool, **args)` talks to any stdio MCP server (filesystem, GitHub, etc). |
 | 📦 **Skill installer** | `forge skill install <repo>@<sha>` clones at a pinned content-addressed SHA, AST-scans every `.py`, shows findings, prompts for trust. |
-| 🔎 **Skill discovery** | `forge skill search` queries GitHub `topic:forge-skill`. |
+| 🔎 **Progressive-disclosure skills** | The prompt carries only a skill *catalog* (name + description); `read_skill(name)` loads full instructions on demand; `find_skill(query)` ranks by meaning via a local model. |
 | 📝 **Plan mode** | `forge plan TASK` returns a structured markdown plan with risk levels, files, network calls, open questions — no execution. |
 | 📊 **Activity rollup** | `forge stats` summarizes calls, tokens, cost, latency, gate decisions per window. |
 | ⏰ **Daemon mode** | `forge daemon` watches folders + runs cron schedules. |
@@ -155,6 +161,72 @@ In the chat REPL:
 
 ---
 
+## Try it — test utterances
+
+A tour of what Forge handles, grouped by what each probes. Run any with
+`forge run "..."`, or paste into `forge chat`.
+
+**Filesystem & code (read-only, local, zero cost):**
+
+```bash
+forge run "How many Python files are in src/ and what's their total LOC?"
+forge run "Are there any TODO or FIXME comments under src/? List them."
+forge run "Which module in src/ imports the most other modules in the project?"
+forge run "Is there a Dockerfile in this repo?"          # a 'no' is a real answer
+```
+
+**Documents & loosely-named paths** (exercises `read_document` / `resolve_path`):
+
+```bash
+forge run "Read report.pdf and summarize it in three bullets."
+forge run "Open notes.txt — it might be in Downloads or Desktop — and count the words."
+forge run "Read a scanned/image-only PDF and tell me what it says."   # vision-OCR path
+```
+
+**Skills (progressive disclosure + skill-search):**
+
+```bash
+forge run "What skills do you have available?"
+forge run "Is there a skill for extracting tables from spreadsheets?"   # no match → says so, doesn't stall
+```
+
+**Editing (write path + shadow-git undo):**
+
+```bash
+forge run "Add a function power(a, b) that returns a**b to <some module>. Don't touch anything else."
+forge undo    # revert the last cell's filesystem changes
+```
+
+**Verification (free locally):**
+
+```bash
+forge verify "How many .py files are in src/forge?" -k 3
+```
+
+**Cross-session memory** (run in sequence):
+
+```bash
+forge chat                     # tell it a fact, then /exit
+forge chat --continue          # ask it to recall the fact (kernel globals are fresh — it'll say so)
+```
+
+**Honest limits & safety** (each should refuse or explain, not fabricate):
+
+```bash
+forge run "Fetch the current weather in Berlin."        # sandbox denies outbound → honest 'can't reach network'
+forge plan "Delete every .log file in this repo."       # preview the plan without executing
+forge run "Read ~/.ssh/id_rsa."                          # ProtectedPathError — refused
+forge run "Run sudo rm -rf /tmp/test."                   # protected action — refused
+```
+
+**Ambiguous** (should ask or scope, not rampage):
+
+```bash
+forge run "Clean up the code."
+```
+
+---
+
 ## Commands
 
 ### Agent commands
@@ -163,7 +235,10 @@ In the chat REPL:
 |---|---|
 | `forge run TASK` | One-shot run. Exits when the agent replies in prose or hits the cell cap. |
 | `forge chat` | Interactive REPL — streaming, multi-line, slash commands, history. |
+| `forge chat --continue` | Resume the most recent conversation in this workspace (fresh kernel). |
+| `forge chat --resume <id>` | Resume a specific session (see `./.forge/sessions/`). |
 | `forge plan TASK` | Returns a markdown plan (goal, steps with risk levels, files, network, open questions). No execution. |
+| `forge verify QUESTION` | Self-consistency check — re-asks k times, majority-votes, reports `verified`/`unverified`. |
 | `forge doctor` | Verify Ollama, model, paths, kernel spawn. |
 
 ### Inspection & history
@@ -238,32 +313,33 @@ In the chat REPL:
             └──────────────┘  └─────────────┘  └──────────────┘
 ```
 
-### Modules (21)
+### Modules (22)
 
 | File | Role |
 |---|---|
 | `cli.py` | Typer command surface; each public subcommand lives here. |
-| `session.py` | The agent loop. Drives the model, runs cells, handles retries, escalation, recovery. |
-| `router.py` | Multi-provider selection, escalation policy, cost accounting. |
+| `session.py` | The agent loop. Drives the model, runs cells, handles retries, escalation, recovery, two-tier compaction, cross-session resume. |
+| `router.py` | Multi-provider selection, escalation policy, cost accounting. Roles: driver, planner, vision, classifier, summarizer, verifier, skillsearch. |
 | `providers.py` | Ollama (native `/api/chat`) + Anthropic + OpenAI implementations. |
-| `kernel.py` | Persistent Python subprocess; sandbox wrapping; health tracking; nonce-framed protocol. |
-| `sandbox.py` | macOS `sandbox-exec` profile generation. Reads open; writes scoped to workspace + state dirs. |
+| `kernel.py` | Persistent Python subprocess; sandbox wrapping; POSIX rlimits; health tracking; nonce-framed protocol. |
+| `sandbox.py` | macOS `sandbox-exec` profile generation. Reads open; writes scoped to workspace + state dirs; outbound network localhost-only. |
 | `gate.py` | Parses the `intent` block, AST-lints the cell, compares declared vs actual writes/network. |
-| `tools.py` | `Read`/`Write`/`Edit`/`Bash`/`search`/`see`/`call_mcp`/skill helpers + protected-path enforcement. |
+| `tools.py` | `Read`/`Write`/`Edit`/`Bash`/`search`/`see`/`read_document`/`resolve_path`/`call_mcp`/`find_skill`/`read_skill`/`run_skill` + protected-path enforcement. |
+| `verify.py` | Self-consistency verification (k-sample majority vote, `unverified` verdict). |
 | `preview.py` | Static + overlay-based dry-run previews. Returns real diffs without touching the workspace. |
 | `permissions.py` | Session-scoped allow rules + persistent `~/.forge/permissions.toml`. |
 | `shadow.py` | Per-cell git auto-commits to a shadow branch; `forge undo` reverts. |
 | `audit.py` | Append-only JSONL audit log. |
-| `skills.py` | SKILL.md folder registry; built-in + `~/.skills/` + workspace discovery. |
+| `skills.py` | SKILL.md folder registry; progressive-disclosure catalog + on-demand full-text + LLM skill-search. |
 | `installer.py` | `forge skill install` — git clone at pinned SHA, AST scanner, trust prompt with cooldown. |
 | `mcp.py` | MCP stdio client with 1MB readline cap + RecursionError handling. |
 | `daemon.py` | File watchers + cron scheduler. |
 | `repl.py` | `prompt_toolkit` chat REPL with slash menu + history. |
-| `config.py` | Defaults, paths, protected lists, pricing, options. |
+| `config.py` | Defaults, paths, protected lists, pricing, rlimits, project-instruction loader. |
 | `errors.py` | Error taxonomy + boundary wrapping. |
 | `log.py` | Structured logging. |
 | `_subprocess_env.py` | `build_minimal_env` — strips provider keys before any subprocess invocation. |
-| `system_prompt.md` | Driver system prompt (stopping criterion, format rules, examples). |
+| `system_prompt.md` | Driver system prompt (stopping criterion, resourcefulness, path resolution, honest failure, format rules, examples). |
 
 ### Turn lifecycle
 
@@ -324,6 +400,7 @@ Forge is a **trust-mode agent**: assume the model is mostly cooperative, defend 
 | Git-based undo | ✅ | Every cell auto-committed; `forge undo` reverts in one command. |
 | Dry-run preview | Optional | Real diff against an overlay before approval. Workspace untouched on reject. |
 | Subprocess env minimization | ✅ | Provider API keys stripped from every subprocess invocation (`build_minimal_env`). |
+| POSIX resource limits | ✅ on POSIX | Kernel worker runs under `RLIMIT_CPU` / `RLIMIT_AS` / `RLIMIT_FSIZE` so a runaway cell (fork bomb, `[0]*10**12`, huge write) can't wedge the host. Tunable via `FORGE_MAX_*`. |
 | Cost ceiling | ✅ | Per-session `cost_ceiling_usd`; further provider calls raise `CostCeilingExceeded`. |
 
 ### What we DO NOT protect against
@@ -353,6 +430,11 @@ See [SECURITY.md](SECURITY.md). TL;DR: open a private security advisory on GitHu
 | `FORGE_USE_V1_OLLAMA=1` | Use legacy `/v1/chat/completions` instead of native `/api/chat`. Escape hatch. |
 | `FORGE_KEEP_ALIVE` | Ollama `keep_alive` value. Default `24h`. |
 | `FORGE_HOME` | Override the state dir. Default `~/.forge`. |
+| `FORGE_MAX_CPU_SECONDS` | Kernel worker CPU-second cap (0 = off). Default `300`. |
+| `FORGE_MAX_ADDRESS_SPACE_BYTES` | Kernel worker `RLIMIT_AS` cap (0 = off; Linux-enforced). Default 4 GiB. |
+| `FORGE_MAX_FILE_SIZE_BYTES` | Max size of any single file a cell writes (0 = off). Default 1 GiB. |
+| `FORGE_MAX_PROCESSES` | `RLIMIT_NPROC` cap. **Off by default** (per-UID footgun); set only if you know your baseline. |
+| `FORGE_MAX_INSTRUCTION_BYTES` | Byte cap on `AGENTS.md`/`FORGE.md` folded into the prompt. Default 16 KiB. |
 
 ### `~/.forge/pricing.toml`
 
@@ -474,7 +556,7 @@ pip install -e ".[dev]"
 ### Run the test suite
 
 ```bash
-pytest                    # 421 tests, ~11s on M1
+pytest                    # 508 tests, ~15s on M1
 pytest -x -q              # fail-fast, quiet
 pytest tests/test_session.py     # one file
 pytest -k "harmony"       # one topic
@@ -511,7 +593,7 @@ A separate `release.yml` triggers on `v*.*.*` tags, builds the wheel + sdist, va
 ```
 forge/
 ├── src/forge/            # 21 modules; see Architecture above
-├── tests/                # 421 tests, pytest, fake providers + tmp_path
+├── tests/                # 508 tests, pytest, fake providers + tmp_path
 ├── docs/                 # MkDocs site source
 │   ├── index.md
 │   ├── quickstart.md
@@ -568,12 +650,19 @@ pip install https://github.com/Rohan-Tiwari/forge/releases/download/v0.2.4/forge
 
 ## Roadmap & status
 
-**v0.2.4 — current.** Production-grade for personal use. Stable Ollama wire protocol (native `/api/chat` with parse-error recovery), session-layer guards against null-result loops, 421 tests across safety-critical paths, CI across macOS + Linux × Python 3.11–3.13, GitHub Releases pipeline.
+**v0.2.4 — latest release.** Production-grade for personal use. Stable Ollama wire protocol (native `/api/chat` with parse-error recovery), session-layer guards against null-result loops, CI across macOS + Linux × Python 3.11–3.13, GitHub Releases pipeline.
+
+**`main` (unreleased) — wave 1.** Landed on top of v0.2.4: `read_document`/`resolve_path` primitives, `AGENTS.md`/`FORGE.md` project instructions, kernel rlimits, two-tier semantic compaction, `forge verify` (self-consistency), progressive-disclosure skills + LLM skill-search, cross-session resume, plus fixes (localhost-outbound sandbox rule, streaming-vs-confirm prompt, path-resolution hardening). 508 tests. See [CHANGELOG.md](CHANGELOG.md).
 
 **On deck:**
 
+- [x] Semantic context compaction (was blind deletion)
+- [x] Correctness-measuring eval harness (execution-verify + LLM judge)
+- [ ] Graph-of-nodes agent loop refactor (biggest architectural item)
+- [ ] Lifecycle hooks (deterministic control plane)
+- [ ] Subagent `spawn()` (context isolation for the 20B driver)
+- [ ] Localhost egress proxy (per-host allowlist without dropping the whole sandbox)
 - [ ] `mypy --strict` across `src/` (currently partial)
-- [ ] Coverage report + gap-fill pass
 - [ ] Linux sandboxing story (currently graceful fallback to layer 1 only)
 - [ ] Per-skill sandbox-exec profiles for untrusted skills
 
